@@ -164,10 +164,40 @@ jobs:
         with:
           path: site
 
+  pages:
+    name: Check GitHub Pages availability
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.pages.outputs.enabled }}
+    steps:
+      - name: Detect whether GitHub Pages is enabled
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${GITHUB_REPOSITORY}/pages" >/tmp/pages.json 2>/tmp/pages.err; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "GitHub Pages is enabled for ${GITHUB_REPOSITORY}."
+          elif grep -q 'HTTP 404' /tmp/pages.err; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GitHub Pages is not enabled for ${GITHUB_REPOSITORY}; skipping deploy."
+          else
+            echo "::error::Failed to query GitHub Pages configuration for ${GITHUB_REPOSITORY}."
+            cat /tmp/pages.err
+            [ ! -s /tmp/pages.json ] || cat /tmp/pages.json
+            exit 1
+          fi
+
   deploy:
     name: Deploy to GitHub Pages
-    if: github.event_name != 'pull_request'
-    needs: build
+    if: >-
+      github.event_name != 'pull_request' &&
+      needs.build.result == 'success' &&
+      needs.pages.result == 'success' &&
+      needs.pages.outputs.enabled == 'true'
+    needs: [build, pages]
     runs-on: ubuntu-latest
     environment:
       name: github-pages
