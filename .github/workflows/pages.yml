@@ -180,9 +180,9 @@ jobs:
           if gh api "repos/${GITHUB_REPOSITORY}/pages" >/tmp/pages.json 2>/tmp/pages.err; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
             echo "GitHub Pages is enabled for ${GITHUB_REPOSITORY}."
-          elif grep -q 'HTTP 404' /tmp/pages.err; then
+          elif grep -Eq 'HTTP (403|404)' /tmp/pages.err; then
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::GitHub Pages is not enabled for ${GITHUB_REPOSITORY}; skipping deploy."
+            echo "::notice::GitHub Pages is unavailable for ${GITHUB_REPOSITORY}; skipping deploy."
           else
             echo "::error::Failed to query GitHub Pages configuration for ${GITHUB_REPOSITORY}."
             cat /tmp/pages.err
