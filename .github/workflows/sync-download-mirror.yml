@@ -40,13 +40,30 @@ jobs:
       DOWNLOADS_DEPLOY_KEY: ${{ secrets.DOWNLOADS_DEPLOY_KEY }}
       DESTINATION_REPOSITORY: opengeos/geolibre-downloads
     steps:
+      - name: Check mirror deploy key
+        id: deploy-key
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ -n "${DOWNLOADS_DEPLOY_KEY:-}" ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "present=false" >> "$GITHUB_OUTPUT"
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "::error::DOWNLOADS_DEPLOY_KEY is not configured."
+            exit 1
+          fi
+          echo "::warning::Skipping the download mirror publish because DOWNLOADS_DEPLOY_KEY is not configured."
+
       - name: Check out GeoLibre
+        if: steps.deploy-key.outputs.present == 'true'
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Wait for release asset producers
-        if: github.event_name == 'workflow_run'
+        if: steps.deploy-key.outputs.present == 'true' && github.event_name == 'workflow_run'
         env:
           RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
@@ -71,12 +88,9 @@ jobs:
           echo "::warning::Timed out waiting for every release workflow; publishing the assets available now."
 
       - name: Configure destination deploy key
+        if: steps.deploy-key.outputs.present == 'true'
         run: |
           set -euo pipefail
-          if [[ -z "${DOWNLOADS_DEPLOY_KEY:-}" ]]; then
-            echo "::error::DOWNLOADS_DEPLOY_KEY is not configured."
-            exit 1
-          fi
           install -d -m 700 "$HOME/.ssh"
           printf '%s\n' "$DOWNLOADS_DEPLOY_KEY" > "$HOME/.ssh/geolibre-downloads"
           chmod 600 "$HOME/.ssh/geolibre-downloads"
@@ -91,6 +105,7 @@ jobs:
 
       - name: Resolve release tag
         id: release
+        if: steps.deploy-key.outputs.present == 'true'
         env:
           REQUESTED_TAG: ${{ inputs.tag }}
           WORKFLOW_TAG: ${{ github.event.workflow_run.head_branch }}
@@ -102,6 +117,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Build candidate manifest
+        if: steps.deploy-key.outputs.present == 'true'
         env:
           DOWNLOAD_MIRROR_METADATA_ONLY: "true"
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
@@ -109,6 +125,7 @@ jobs:
 
       - name: Skip an unchanged mirror
         id: changes
+        if: steps.deploy-key.outputs.present == 'true'
         working-directory: ${{ runner.temp }}
         run: |
           set -euo pipefail
@@ -126,13 +143,13 @@ jobs:
           echo "publish=true" >> "$GITHUB_OUTPUT"
 
       - name: Build mirror
-        if: steps.changes.outputs.publish == 'true'
+        if: steps.deploy-key.outputs.present == 'true' && steps.changes.outputs.publish == 'true'
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: scripts/build-download-mirror.sh "$RUNNER_TEMP/site" "$RELEASE_TAG"
 
       - name: Publish an orphan snapshot
-        if: steps.changes.outputs.publish == 'true'
+        if: steps.deploy-key.outputs.present == 'true' && steps.changes.outputs.publish == 'true'
         working-directory: ${{ runner.temp }}/site
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
