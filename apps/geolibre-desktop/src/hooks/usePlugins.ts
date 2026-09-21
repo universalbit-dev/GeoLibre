@@ -2,11 +2,13 @@ import {
   clearExternalNativePaintBridge,
   setExternalNativePaintBridge,
   useAppStore,
+  type AppState,
 } from "@geolibre/core";
 import { buildProjectEgressSnapshot } from "../lib/build-project-snapshot";
 import { nativeWmsTileUrl } from "../lib/native-wms-url";
 import {
   addRasterToMap,
+  readRasterWindow,
   setRasterRenderEngine,
   addZarrRasterLayer,
   buildSelectorTimeBinding,
@@ -40,6 +42,8 @@ import {
   maplibreNasaEarthdataPlugin,
   maplibreNationalMapPlugin,
   maplibreOpenAerialMapPlugin,
+  maplibreOsmDownloaderPlugin,
+  maplibreIgnLidarHdPlugin,
   maplibreArcGisHubPlugin,
   maplibreCkanPlugin,
   maplibreSocrataPlugin,
@@ -48,8 +52,10 @@ import {
   maplibreNaturalEarthPlugin,
   maplibreHuggingFacePlugin,
   maplibreGeoLensPlugin,
+  setGeoLensDefaultServerUrl,
   maplibreVantorPlugin,
   maplibrePlanetOpenDataPlugin,
+  maplibrePortolanPlugin,
   maplibreOvertureMapsPlugin,
   queryOvertureFeatures,
   maplibreGraticulePlugin,
@@ -70,6 +76,7 @@ import {
   maplibreSunPlugin,
   maplibreRouteAnimationPlugin,
   flightSimulatorPlugin,
+  godsEyeViewPlugin,
   maplibreSwipePlugin,
   SWIPE_PLUGIN_ID,
   maplibreTimelapsePlugin,
@@ -88,6 +95,7 @@ import {
   getActiveRightPanelDock,
   registerAssistantTool,
   registerAssistantToolSpec,
+  registerAssistantGuidance,
   registerToolbarMenu,
   unregisterToolbarMenu,
   registerFloatingPanel,
@@ -96,6 +104,7 @@ import {
   closeFloatingPanel,
   getOpenFloatingPanels,
 } from "@geolibre/plugins";
+import { readDeploymentEnvValue } from "../lib/deployment-env";
 import { CesiumEngine, getPrimaryCesiumControlHost, type MapEngine } from "@geolibre/map";
 import type {
   GeoLibreCogLayerOptions,
@@ -110,6 +119,7 @@ import type {
   GeoLibreZarrQueryGeometry,
   GeoLibreZarrQueryOptions,
   GeoLibreZarrQuerySelector,
+  GeoLibreRasterWindowOptions,
 } from "@geolibre/plugins";
 import { cogEngineDefaults } from "../lib/cog-render-engine";
 import { invoke } from "@tauri-apps/api/core";
@@ -190,6 +200,7 @@ interface TauriRuntimeWindow extends Window {
 }
 
 const manager = new PluginManager();
+setGeoLensDefaultServerUrl(readDeploymentEnvValue("VITE_GEOLENS_DEFAULT_URL"));
 manager.registerAll([
   maplibreLayerControlPlugin,
   maplibreGeoEditorPlugin,
@@ -206,8 +217,11 @@ manager.registerAll([
   maplibreUsgsNldiPlugin,
   maplibreVantorPlugin,
   maplibrePlanetOpenDataPlugin,
+  maplibrePortolanPlugin,
   maplibreEarthdataGisPlugin,
   maplibreOpenAerialMapPlugin,
+  maplibreOsmDownloaderPlugin,
+  maplibreIgnLidarHdPlugin,
   maplibreArcGisHubPlugin,
   maplibreSocrataPlugin,
   maplibreCkanPlugin,
@@ -243,6 +257,7 @@ manager.registerAll([
   maplibreSunPlugin,
   maplibreRouteAnimationPlugin,
   flightSimulatorPlugin,
+  godsEyeViewPlugin,
   // Last visible entry of the Plugins menu; the ids below are skipped by
   // PluginsMenu and surface elsewhere.
   maplibreSamGeoPlugin,
@@ -851,13 +866,39 @@ export function useTimeSliderAutoClose(mapControllerRef: RefObject<MapEngine | n
   }, [mapControllerRef]);
 }
 
+/**
+ * The basemap a plugin sees as active: the Mapbox-only style while Mapbox is
+ * the primary renderer, otherwise the shared MapLibre/Cesium basemap.
+ *
+ * `setBasemap` writes the same two fields, so `getActiveBasemap` and
+ * `onBasemapChange` must read them through this one helper or a Mapbox style
+ * change is written but never reported to `onBasemapChange` subscribers.
+ */
+function effectiveBasemapUrl(
+  state: Pick<AppState, "primaryRenderer" | "preferences" | "basemapStyleUrl">,
+): string {
+  return state.primaryRenderer === "mapbox"
+    ? (state.preferences.map.mapboxStyleUrl ?? state.basemapStyleUrl)
+    : state.basemapStyleUrl;
+}
+
 export function createAppAPI(mapControllerRef?: RefObject<MapEngine | null>) {
   const store = useAppStore.getState();
   // Captured so methods that delegate to plugin helpers taking the AppAPI
   // itself (e.g. addCogLayer -> addRasterToMap) can pass `api`. Only read
   // when those methods are called, which is always after assignment.
   const api = {
-    setBasemap: (url: string) => store.setBasemapStyleUrl(url),
+    setBasemap: (url: string) => {
+      const state = useAppStore.getState();
+      if (state.primaryRenderer === "mapbox") {
+        state.setPreferences({
+          ...state.preferences,
+          map: { ...state.preferences.map, mapboxStyleUrl: url },
+        });
+      } else {
+        state.setBasemapStyleUrl(url);
+      }
+    },
     addGeoJsonLayer: (name: string, data: GeoJSON.FeatureCollection, sourcePath?: string) => {
       const id = store.addGeoJsonLayer(name, data, sourcePath);
       return id;
@@ -1015,11 +1056,24 @@ export function createAppAPI(mapControllerRef?: RefObject<MapEngine | null>) {
       return detach;
     },
     unregisterTemporalLayer: (layerId: string) => unregisterTemporalLayer(layerId),
-    getActiveBasemap: () => useAppStore.getState().basemapStyleUrl,
+    getActiveBasemap: () => effectiveBasemapUrl(useAppStore.getState()),
+    getBasemapLayerIds: () => mapControllerRef?.current?.getBasemapStyleLayerIds() ?? [],
     onBasemapChange: (callback: (styleUrl: string) => void) =>
       useAppStore.subscribe((state, prev) => {
-        if (state.basemapStyleUrl !== prev.basemapStyleUrl) {
-          callback(state.basemapStyleUrl);
+        const current = effectiveBasemapUrl(state);
+        if (current !== effectiveBasemapUrl(prev)) {
+          callback(current);
+        }
+      }),
+    getLayers: () => useAppStore.getState().layers.map((layer) => layer.id),
+    onLayersChanged: (callback: (layerIds: string[]) => void) =>
+      useAppStore.subscribe((state, prev) => {
+        const layerIds = state.layers.map((layer) => layer.id);
+        if (
+          layerIds.length !== prev.layers.length ||
+          layerIds.some((id, index) => id !== prev.layers[index]?.id)
+        ) {
+          callback(layerIds);
         }
       }),
     fetchArrayBuffer: fetchRemoteArrayBuffer,
@@ -1056,7 +1110,41 @@ export function createAppAPI(mapControllerRef?: RefObject<MapEngine | null>) {
       mapControllerRef?.current?.fitBounds(bounds),
     getViewBounds: () => mapControllerRef?.current?.getViewBounds() ?? null,
     getMap: () => mapControllerRef?.current?.getMap() ?? null,
+    readRasterWindow: (layerId: string, options: GeoLibreRasterWindowOptions) =>
+      readRasterWindow(layerId, options),
     getMapRenderer: () => useAppStore.getState().primaryRenderer,
+    getArcgisView: () => {
+      const engine = mapControllerRef?.current;
+      return engine?.kind === "arcgis" &&
+        "getView" in engine &&
+        typeof engine.getView === "function"
+        ? engine.getView()
+        : null;
+    },
+    getMapboxMap: () => {
+      const engine = mapControllerRef?.current;
+      return engine?.kind === "mapbox" &&
+        "getMapboxMap" in engine &&
+        typeof engine.getMapboxMap === "function"
+        ? engine.getMapboxMap()
+        : null;
+    },
+    getMapboxGl: () => {
+      const engine = mapControllerRef?.current;
+      return engine?.kind === "mapbox" &&
+        "getMapboxGl" in engine &&
+        typeof engine.getMapboxGl === "function"
+        ? engine.getMapboxGl()
+        : null;
+    },
+    getMapboxAccessToken: () => {
+      const engine = mapControllerRef?.current;
+      return engine?.kind === "mapbox" &&
+        "getMapboxAccessToken" in engine &&
+        typeof engine.getMapboxAccessToken === "function"
+        ? engine.getMapboxAccessToken()
+        : null;
+    },
     getCesiumScene: () => {
       const engine = mapControllerRef?.current;
       return engine instanceof CesiumEngine ? engine.getCesiumScene() : null;
@@ -1301,6 +1389,7 @@ export function createAppAPI(mapControllerRef?: RefObject<MapEngine | null>) {
     ...createPluginLocaleApi(i18n),
     registerAssistantTool,
     registerAssistantToolSpec,
+    registerAssistantGuidance,
     registerToolbarMenu,
     unregisterToolbarMenu,
     registerFloatingPanel,

@@ -1,11 +1,12 @@
 // @refresh reset
-import { useAppStore, type GeoLibreLayer } from "@geolibre/core";
+import { localFileName, useAppStore, type GeoLibreLayer } from "@geolibre/core";
 import type { FeatureCollection } from "geojson";
 import type { MapDiagnosticEvent, MapEngine } from "@geolibre/map";
 import { getLayerBounds, MapCanvas, setExternalDeckLayerOrderHandler } from "@geolibre/map";
 import { useTranslation } from "react-i18next";
 import {
   addRasterToMap,
+  addVectorFileToMap,
   prepareRasterControl,
   applyRasterLayerOrder,
   applyStacSearchLayerOrder,
@@ -23,10 +24,12 @@ import {
   REVERSE_GEOCODE_PLUGIN_ID,
   restoreEffects,
   restoreLidarLayers,
+  restoreArcgisZarrLayers,
   restorePlanetaryComputerLayers,
   reattachSun,
   reattachRouteAnimation,
   reattachFlightSimulator,
+  reattachGodsEyeView,
   restoreArcGISViewportLayers,
   restoreRasterLayers,
   restoreThreeDTilesLayers,
@@ -94,8 +97,10 @@ import {
   loadDroppedVectorFiles,
   loadDroppedVectorPaths,
   readLocalFileText,
+  readLocalFileBytes,
   type DroppedRaster,
 } from "../../lib/tauri-io";
+import { importGeoPackageDrops } from "../../lib/geopackage-drop";
 import { buildKmlModelLayer } from "../../lib/kml-model-layer";
 import { PLANET_SWITCHER_LABEL_KEYS } from "../../lib/planet-labels";
 import { isPhotoDropFileName, type GeotaggedPhotoResult } from "../../lib/geotagged-photos";
@@ -135,6 +140,7 @@ import { useGlobalRasterIdentify } from "../../hooks/useGlobalRasterIdentify";
 import { useNetcdfIdentify } from "../../hooks/useNetcdfIdentify";
 import { useTerrainRestore } from "../../hooks/useTerrainRestore";
 import { useCogSpectralIdentify } from "../../hooks/useCogSpectralIdentify";
+import { useRasterViewportStretch } from "../../hooks/useRasterViewportStretch";
 import {
   useAutoCollapsedPanel,
   useReplaceLayersPanelId,
@@ -161,6 +167,8 @@ import { MapContextMenu } from "./MapContextMenu";
 import { KnowledgeCardPanel, type KnowledgePlace } from "./KnowledgeCardPanel";
 import { KnowledgeCardConsentDialog } from "./KnowledgeCardConsentDialog";
 import { MapGrid } from "./MapGrid";
+import { PrimaryMapboxCanvas } from "./PrimaryMapboxCanvas";
+import { PrimaryArcgisCanvas } from "./PrimaryArcgisCanvas";
 import { PrimaryCesiumCanvas } from "./PrimaryCesiumCanvas";
 import { RemoteCursorsOverlay } from "./RemoteCursorsOverlay";
 import { useCommandBridge } from "../../hooks/useCommandBridge";
@@ -522,7 +530,7 @@ function hasDroppedFiles(event: DragEvent<HTMLElement>): boolean {
 }
 
 function fileNameFromPath(path: string): string {
-  return path.split(/[/\\]/).pop() ?? path;
+  return localFileName(path);
 }
 
 function layerNameFromPath(path: string): string {
@@ -711,7 +719,7 @@ export function DesktopShell({
   const handleKnowledgeFlyTo = useCallback((lat: number, lon: number) => {
     mapControllerRef.current?.flyTo({
       center: [lon, lat],
-      zoom: Math.max(mapControllerRef.current?.getMap()?.getZoom() ?? 12, 14),
+      zoom: Math.max(mapControllerRef.current?.readView().zoom ?? 12, 14),
     });
   }, []);
   // The COG/WMS/XYZ layer whose bounding-box subset is being extracted in the
@@ -933,8 +941,12 @@ export function DesktopShell({
   // Live-collaboration session. Owned here (rather than in TopToolbar) so both
   // the Collaborate dialog and the on-canvas status badge share one socket, and
   // so the dialog stays mounted in toolbar-hidden layouts.
-  const collaboration = useCollaboration(mapControllerRef);
-  const commentTool = useCommentTool({ mapControllerRef, collaboration, mapReadyGeneration });
+  const collaboration = useCollaboration(mapControllerRef, mapReadyGeneration);
+  const commentTool = useCommentTool({
+    mapControllerRef,
+    collaboration,
+    mapReadyGeneration,
+  });
   const [showResolvedComments, setShowResolvedComments] = useState(false);
   const [selectedCommentId, setSelectedCommentId] = useState<string | null>(null);
   const collaborateDialogOpen = useAppStore((s) => s.ui.collaborateDialogOpen);
@@ -967,6 +979,7 @@ export function DesktopShell({
   useRasterIdentify();
   useNetcdfIdentify(mapControllerRef, mapReadyGeneration);
   useCogSpectralIdentify(mapControllerRef, mapReadyGeneration);
+  useRasterViewportStretch(mapControllerRef, mapReadyGeneration);
   useTerrainRestore(mapControllerRef, mapReadyGeneration, projectGeneration);
   const [layerPanelWidth, setLayerPanelWidth] = useState(initialSidePanelWidth);
   const [stylePanelWidth, setStylePanelWidth] = useState(initialSidePanelWidth);
@@ -1300,14 +1313,39 @@ export function DesktopShell({
     // The flight simulator holds a reference to the live map (and suspends its
     // interaction handlers while flying), so rebind it after a map re-init too.
     reattachFlightSimulator(appAPI);
+    // VectorControl has a Cesium bridge and must restore on either engine.
+    restoreVectorLayers(appAPI);
+    if (engine.kind === "mapbox" || (engine.kind === "arcgis" && engine.capabilities.deckOverlay)) {
+      restoreThreeDTilesLayers(appAPI);
+      void restoreLidarLayers(appAPI).catch(console.error);
+    }
+    // Same contract for the shared deck.gl overlay: re-attach it to the current
+    // map and re-render any deckgl-viz layers a restored project carries. It
+    // binds to either 2D engine (`getMap()` or `getMapboxMap()`), so it sits
+    // above the native-map gate below; on Cesium the plugin manager has
+    // already deactivated the plugin and this only clears its layers.
+    restoreDeckViz(appAPI, pluginManager.isActive(DECK_VIZ_PLUGIN_ID));
+    // The route animation owns native marker/trail layers, so rebind it to the
+    // (possibly new) map after a re-init/basemap swap without deriving
+    // open/closed state (project loads handle that via applyProjectState). It
+    // binds to either 2D engine through getStyleMap, so it sits above the
+    // native-map gate like the deck.gl overlay; on Cesium the plugin manager
+    // has already deactivated it and this only detaches the engine.
+    reattachRouteAnimation(appAPI);
+    // God's Eye View holds the Cesium handle it pushes its CZML feeds at, so it
+    // has to rebind after a renderer swap too. It sits above the native-map gate
+    // because the handle it wants is the globe's, which that gate excludes.
+    // Reattach only — the per-feed toggles come from its applyProjectState.
+    reattachGodsEyeView(appAPI);
     if (!engine.capabilities.nativeMapInstance) {
+      if (engine.kind === "mapbox" || engine.kind === "arcgis") restoreRasterLayers(appAPI);
+      if (engine.kind === "arcgis") restoreArcgisZarrLayers();
       void restoreLocalFileLayers();
       return;
     }
     restoreThreeDTilesLayers(appAPI);
     restoreRasterLayers(appAPI);
     restorePlanetaryComputerLayers(appAPI);
-    restoreVectorLayers(appAPI);
     // Re-bind saved ArcGIS feature layers to the viewport. Without this a
     // reopened project's layer stays frozen on the extent it was saved with.
     restoreArcGISViewportLayers(appAPI);
@@ -1330,10 +1368,6 @@ export function DesktopShell({
       if (applyStacSearchLayerOrder(layerId, beforeId)) return;
       applyRasterLayerOrder(layerId, beforeId);
     });
-    // The route animation owns native marker/trail layers, so rebind it to the
-    // (possibly new) map after a re-init/basemap swap without deriving
-    // open/closed state (project loads handle that via applyProjectState).
-    reattachRouteAnimation(appAPI);
     // Rebind the directions tool to the (possibly new) map instance after a
     // map re-init, since restoreProjectState skips an already-active plugin.
     restoreDirections(appAPI, pluginManager.isActive(DIRECTIONS_PLUGIN_ID));
@@ -1346,9 +1380,6 @@ export function DesktopShell({
       pluginManager.deactivate(REVERSE_GEOCODE_PLUGIN_ID, appAPI);
     }
     restoreReverseGeocode(appAPI, pluginManager.isActive(REVERSE_GEOCODE_PLUGIN_ID));
-    // Same contract for the deck.gl overlay: re-attach it to the current map
-    // and re-render any deckgl-viz layers a restored project carries.
-    restoreDeckViz(appAPI, pluginManager.isActive(DECK_VIZ_PLUGIN_ID));
   }, [enforceViewerPlugins, externalPluginsReady, mapReadyGeneration, projectGeneration]);
 
   useEffect(() => {
@@ -1377,7 +1408,7 @@ export function DesktopShell({
     externalPluginsReady,
     projectUrlLoadState?.status === "loading" || dataUrlLoadState?.status === "loading",
     projectUrlLoadState?.error ?? dataUrlLoadState?.error ?? null,
-    cesiumPrimary,
+    primaryRenderer !== "maplibre",
   );
   const setObjectDetectionOpen = useAppStore((s) => s.setObjectDetectionOpen);
   const setSegmentEverythingOpen = useAppStore((s) => s.setSegmentEverythingOpen);
@@ -1394,7 +1425,7 @@ export function DesktopShell({
   // globe and the panel springs back the moment the user returns to 2D, long
   // after they meant to dismiss it (#2217 review).
   useEffect(() => {
-    if (!cesiumPrimary) return;
+    if (primaryRenderer === "maplibre") return;
     // Bump the readiness generation on the hand-off. It is no longer *reset*
     // (that is what left every consumer pointing at nothing on the globe), but
     // the reset did do one useful thing: it forced the generation-gated effects
@@ -1409,7 +1440,7 @@ export function DesktopShell({
     setBasemapExtractOpen(false);
     setObjectDetectionOpen(false);
     setSegmentEverythingOpen(false);
-  }, [cesiumPrimary, setObjectDetectionOpen, setSegmentEverythingOpen]);
+  }, [primaryRenderer, setObjectDetectionOpen, setSegmentEverythingOpen]);
 
   // Keep the on-map compass (reset pitch/bearing) control's tooltip translated.
   // Re-runs when the controller (re)initialises (mapReadyGeneration) and on
@@ -1453,6 +1484,8 @@ export function DesktopShell({
       // Frame ids for each time-animated overlay sequence (keyed by the loader's
       // group marker), so they can be gathered into one layer group afterward.
       const frameGroups = new Map<string, string[]>();
+      // The same for time-tagged KML placemark layers outside any Folder.
+      const placemarkFrameGroups = new Map<string, { name: string; ids: string[] }>();
       // KML Folder ancestry becomes nested GeoLibre groups. Prefix keys with
       // the source path so identically named folders from separate files do not
       // get combined when several files are imported in one batch.
@@ -1465,6 +1498,9 @@ export function DesktopShell({
       // whose placemarks are followed by an overlay or model is still
       // recognized as the last source imported.
       let lastSourcePath: string | null = null;
+      // Whether any time-tagged KML placemark layer was added, so the Time
+      // Slider opens even when every frame already sits in a KML Folder group.
+      let hasVectorTimeFrames = false;
       for (const layer of importedLayers) {
         if (layer.path) lastSourcePath = layer.path;
         if (isLoadedKmlSuperOverlay(layer)) {
@@ -1531,6 +1567,28 @@ export function DesktopShell({
           );
         }
         lastLayerId = addGeoJsonLayer(layerName, layer.data, layer.path);
+        // Time-tagged KML placemarks are Time Slider frames, animated through
+        // the same `metadata.timeSpan` visibility toggling as ground overlays.
+        if (layer.timeSpan) {
+          const frameId = lastLayerId;
+          // `addGeoJsonLayer` starts every layer with empty metadata.
+          useAppStore.getState().updateLayer(frameId, {
+            metadata: { timeSpan: layer.timeSpan },
+            ...(layer.visible === false ? { visible: false } : {}),
+          });
+          hasVectorTimeFrames = true;
+          // Frames outside any KML Folder are gathered into one group named
+          // after their file below; foldered frames already sit in their
+          // Folder groups.
+          if (layer.groupId && !layer.groupPath?.length) {
+            const group = placemarkFrameGroups.get(layer.groupId) ?? {
+              name: layerNameFromPath(layer.path),
+              ids: [],
+            };
+            group.ids.push(frameId);
+            placemarkFrameGroups.set(layer.groupId, group);
+          }
+        }
         if (layer.path) {
           const sourceIds = layerIdsBySource.get(layer.path) ?? [];
           sourceIds.push(lastLayerId);
@@ -1574,7 +1632,10 @@ export function DesktopShell({
             : t("kml.timeOverlayGroup");
         addLayerGroup(name, ids);
       });
-      const hasTimeAnimation = sequences.length > 0;
+      for (const { name, ids } of placemarkFrameGroups.values()) {
+        if (ids.length > 1) addLayerGroup(name, ids);
+      }
+      const hasTimeAnimation = sequences.length > 0 || hasVectorTimeFrames;
       // Auto-open the Time Slider so a time-animated overlay sequence can be
       // stepped through immediately, without the user hunting for the plugin.
       if (hasTimeAnimation && !isPluginActive(TIME_SLIDER_PLUGIN_ID)) {
@@ -1742,8 +1803,8 @@ export function DesktopShell({
   );
 
   const finishDrop = useCallback(
-    (importedLayers: ImportedVectorLayer[], rasterCount: number) => {
-      if (!importedLayers.length && !rasterCount) {
+    (importedLayers: ImportedVectorLayer[], rasterCount: number, containerCount = 0) => {
+      if (!importedLayers.length && !rasterCount && !containerCount) {
         throw new Error("Drop a supported vector or raster file.");
       }
       if (importedLayers.length) addImportedVectorLayers(importedLayers);
@@ -1751,7 +1812,7 @@ export function DesktopShell({
       // so the confirmation echoes what the user just added, instead of a bare
       // count that can read like "nothing happened" while the source panel
       // stays open (opengeos/GeoLibre#666).
-      if (importedLayers.length === 1 && !rasterCount) {
+      if (importedLayers.length === 1 && !rasterCount && !containerCount) {
         const only = importedLayers[0];
         // `||` (not `??`) so an empty-string name also falls back to the path.
         setDropMessage(
@@ -1765,19 +1826,20 @@ export function DesktopShell({
       // order and the connector inside the translation catalog. The mixed
       // case composes two independently pluralized noun phrases into its
       // sentence, since one i18next key can pluralize only a single count.
+      const vectorCount = importedLayers.length + containerCount;
       setDropMessage(
-        importedLayers.length && rasterCount
+        vectorCount && rasterCount
           ? t("toolbar.fileDrop.addedBoth", {
               vector: t("toolbar.fileDrop.bothVectorLayers", {
-                count: importedLayers.length,
+                count: vectorCount,
               }),
               raster: t("toolbar.fileDrop.bothRasterLayers", {
                 count: rasterCount,
               }),
             })
-          : importedLayers.length
+          : vectorCount
             ? t("toolbar.fileDrop.addedVectorLayers", {
-                count: importedLayers.length,
+                count: vectorCount,
               })
             : t("toolbar.fileDrop.addedRasterLayers", { count: rasterCount }),
       );
@@ -1932,7 +1994,18 @@ export function DesktopShell({
 
             if (restPaths.length > 0) {
               const rasterCount = await addDroppedRasters(await loadDroppedRasterPaths(restPaths));
-              const importedLayers = await loadDroppedVectorPaths(restPaths, {
+              const containers = await importGeoPackageDrops(restPaths, {
+                readPath: readLocalFileBytes,
+                addFile: (file, sourcePath) =>
+                  addVectorFileToMap(createAppAPI(mapControllerRef), file, {
+                    sourcePath,
+                  }),
+                onError: (name, error) =>
+                  setDropError(
+                    `${name}: ${error instanceof Error ? error.message : String(error)}`,
+                  ),
+              });
+              const importedLayers = await loadDroppedVectorPaths(containers.remaining, {
                 onLargeDataset: confirmLargeVectorDataset,
               });
               // See the browser handler: skip finishDrop's empty-input error
@@ -1942,9 +2015,12 @@ export function DesktopShell({
               if (
                 importedLayers.length > 0 ||
                 rasterCount > 0 ||
-                (pbfPaths.length === 0 && photoResult === null)
+                containers.layerCount > 0 ||
+                (pbfPaths.length === 0 && photoResult === null && containers.count === 0)
               ) {
-                finishDrop(importedLayers, rasterCount);
+                finishDrop(importedLayers, rasterCount, containers.layerCount);
+              } else if (pbfPaths.length === 0 && photoResult === null) {
+                setDropMessage(null);
               }
             }
           } catch (error) {
@@ -2117,7 +2193,18 @@ export function DesktopShell({
 
         if (restFiles.length > 0) {
           const rasterCount = await addDroppedRasters(loadDroppedRasterFiles(restFiles));
-          const importedLayers = await loadDroppedVectorFiles(restFiles, {
+          // Use the Add Data control so containers share its layer picker,
+          // per-table source metadata, and grouped import behavior.
+          const containers = await importGeoPackageDrops(restFiles, {
+            readPath: readLocalFileBytes,
+            addFile: (file, sourcePath) =>
+              addVectorFileToMap(createAppAPI(mapControllerRef), file, {
+                sourcePath,
+              }),
+            onError: (name, error) =>
+              setDropError(`${name}: ${error instanceof Error ? error.message : String(error)}`),
+          });
+          const importedLayers = await loadDroppedVectorFiles(containers.remaining, {
             onLargeDataset: confirmLargeVectorDataset,
           });
           // Call finishDrop (which reports success or throws the empty-input
@@ -2131,9 +2218,12 @@ export function DesktopShell({
           if (
             importedLayers.length > 0 ||
             rasterCount > 0 ||
-            (pbfFiles.length === 0 && photoResult === null)
+            containers.layerCount > 0 ||
+            (pbfFiles.length === 0 && photoResult === null && containers.count === 0)
           ) {
-            finishDrop(importedLayers, rasterCount);
+            finishDrop(importedLayers, rasterCount, containers.layerCount);
+          } else if (pbfFiles.length === 0 && photoResult === null) {
+            setDropMessage(null);
           }
         }
       } catch (error) {
@@ -2410,6 +2500,7 @@ export function DesktopShell({
   return (
     <div
       ref={shellRef}
+      data-testid="desktop-shell"
       className="relative flex h-full min-w-0 flex-col overflow-hidden bg-background"
       style={shellStyle}
       onDragEnter={handleDragEnter}
@@ -2619,7 +2710,19 @@ export function DesktopShell({
                   where `PrimaryCesiumCanvas` explains the absence. Renderer-
                   neutral, store-driven overlays sit outside the branch and are
                   available under either engine. */}
-              {cesiumPrimary ? (
+              {primaryRenderer === "mapbox" ? (
+                <PrimaryMapboxCanvas
+                  canUseRemoteElevation={hasElevationConsent}
+                  engineRef={mapControllerRef}
+                  onEngineReady={handleMapControllerReady}
+                  onMapDiagnosticEvent={handleMapDiagnosticEvent}
+                />
+              ) : primaryRenderer === "arcgis" ? (
+                <PrimaryArcgisCanvas
+                  engineRef={mapControllerRef}
+                  onEngineReady={handleMapControllerReady}
+                />
+              ) : cesiumPrimary ? (
                 <PrimaryCesiumCanvas
                   engineRef={mapControllerRef}
                   onEngineReady={handleMapControllerReady}
@@ -2634,35 +2737,6 @@ export function DesktopShell({
                     onMapDiagnosticEvent={handleMapDiagnosticEvent}
                     onControllerReady={handleMapControllerReady}
                   />
-                  <RemoteCursorsOverlay mapControllerRef={mapControllerRef} />
-                  <CommentMapOverlay
-                    mapControllerRef={mapControllerRef}
-                    onSelectComment={(commentId) => {
-                      setSelectedCommentId(commentId);
-                      openRightPanel(COMMENTS_PANEL_ID);
-                    }}
-                    showResolved={showResolvedComments}
-                  />
-                  <MapContextMenu
-                    mapControllerRef={mapControllerRef}
-                    mapReadyGeneration={mapReadyGeneration}
-                    onExplorePlace={handleExplorePlace}
-                  />
-                  <KnowledgeCardPanel
-                    place={knowledgePlace}
-                    lang={wikipediaLang(i18n.language)}
-                    onClose={() => setKnowledgePlace(null)}
-                    onFlyTo={handleKnowledgeFlyTo}
-                  />
-                  {/* Isolate the collaboration badge in its own boundary: it renders
-                  over the map, so a fault here must never take down the map
-                  itself (it shares this subtree's error boundary otherwise). */}
-                  <SilentErrorBoundary label="Collaboration status">
-                    <CollaborationStatusBadge
-                      api={collaboration}
-                      mapControllerRef={mapControllerRef}
-                    />
-                  </SilentErrorBoundary>
                   <MapModeBanner mapControllerRef={mapControllerRef} />
                   <PixelTimeSeriesControl mapControllerRef={mapControllerRef} />
                   <NetcdfSampleMarkers
@@ -2677,21 +2751,53 @@ export function DesktopShell({
                     <NetcdfCubeWindow mapControllerRef={mapControllerRef} />
                   </SilentErrorBoundary>
                   <NetcdfCubeSetupDialog mapControllerRef={mapControllerRef} />
-                  <MapLegendPanel
-                    mapControllerRef={mapControllerRef}
-                    mapReadyGeneration={mapReadyGeneration}
-                  />
                   <Suspense fallback={null}>
                     <ObjectDetectionDialog mapControllerRef={mapControllerRef} />
                   </Suspense>
                   <Suspense fallback={null}>
                     <SegmentEverythingPanel mapControllerRef={mapControllerRef} />
                   </Suspense>
-                  <StoryMapComposeBar mapControllerRef={mapControllerRef} />
                 </>
               )}
-              {/* Renderer-neutral: these read the store rather than a
-                  `MapController`, so they stay available on the 3D globe. */}
+              {/* Renderer-neutral: these use the store or `MapEngine`, so they
+                  stay available on every renderer. */}
+              <RemoteCursorsOverlay
+                mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
+              />
+              <CommentMapOverlay
+                mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
+                onSelectComment={(commentId) => {
+                  setSelectedCommentId(commentId);
+                  openRightPanel(COMMENTS_PANEL_ID);
+                }}
+                showResolved={showResolvedComments}
+              />
+              {/* Isolate the collaboration badge in its own boundary: it renders
+                  over the map, so a fault here must never take down the map. */}
+              <SilentErrorBoundary label="Collaboration status">
+                <CollaborationStatusBadge api={collaboration} mapControllerRef={mapControllerRef} />
+              </SilentErrorBoundary>
+              <MapLegendPanel
+                mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
+              />
+              <MapContextMenu
+                mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
+                onExplorePlace={handleExplorePlace}
+              />
+              <KnowledgeCardPanel
+                place={knowledgePlace}
+                lang={wikipediaLang(i18n.language)}
+                onClose={() => setKnowledgePlace(null)}
+                onFlyTo={handleKnowledgeFlyTo}
+              />
+              <StoryMapComposeBar
+                mapControllerRef={mapControllerRef}
+                mapReadyGeneration={mapReadyGeneration}
+              />
               <TerrainSettingsDialog mapControllerRef={mapControllerRef} />
               <RasterSubsetPanel
                 layer={rasterSubsetLayer}
@@ -2746,7 +2852,7 @@ export function DesktopShell({
             displayName={t("shell.section.selectionPanels")}
           >
             <Suspense fallback={null}>
-              <SelectByExpressionDialog />
+              <SelectByExpressionDialog canEditLayer={collaboration.canEditLayer} />
             </Suspense>
             <Suspense fallback={null}>
               <SelectByLocationDialog />
@@ -3040,7 +3146,10 @@ export function DesktopShell({
         <SegmentationDialog mapControllerRef={mapControllerRef} />
       </Suspense>
       <StoryMapPanel mapControllerRef={mapControllerRef} />
-      <StoryMapPresenter mapControllerRef={mapControllerRef} />
+      <StoryMapPresenter
+        mapControllerRef={mapControllerRef}
+        mapReadyGeneration={mapReadyGeneration}
+      />
       <div
         ref={verticalResizeGuideRef}
         className="pointer-events-none fixed bottom-7 top-11 z-50 hidden w-px bg-primary shadow-[0_0_0_1px_hsl(var(--primary)/0.25)]"

@@ -381,13 +381,13 @@ def build_empty_project(
         center: Optional ``[lng, lat]`` map center.
         zoom: Optional initial zoom level.
         basemap_url: Optional MapLibre style URL; defaults to the app default.
-        renderer: ``"maplibre"`` (default) or ``"cesium"``.
+        renderer: ``"maplibre"`` (default), ``"cesium"``, ``"mapbox"``, or ``"arcgis"``.
 
     Returns:
         A project dict ready to be assigned to the widget's ``project`` trait.
     """
-    if renderer not in {"maplibre", "cesium"}:
-        raise ValueError("renderer must be maplibre or cesium")
+    if renderer not in {"maplibre", "cesium", "mapbox", "arcgis"}:
+        raise ValueError("renderer must be maplibre, cesium, mapbox, or arcgis")
     map_view = default_map_view()
     if center is not None:
         if len(center) != 2:
@@ -1744,12 +1744,48 @@ def czml_layer(
     metadata: dict[str, Any] = {
         "sourceKind": CZML_SOURCE_KIND,
         "externalNativeLayer": True,
-        "identifiable": False,
+        # Cesium builds real entities from the document and the globe's layer
+        # sync answers for them, so a click can read a packet's name and custom
+        # properties. Mirrors ``createCzmlLayer`` in ``@geolibre/core``.
+        "identifiable": True,
         "sourceId": source_id,
         "nativeLayerIds": [source_id],
     }
     layer["source"] = source
     layer["metadata"] = metadata
+    return layer
+
+
+def cesium_kml_layer(
+    name: str,
+    *,
+    url: str | None = None,
+    data: str | None = None,
+    source_path: str | None = None,
+    **style: Any,
+) -> dict[str, Any]:
+    """Build a native globe KML/KMZ layer preserving document styling.
+
+    Supply a URL, inline KML XML, or a KMZ data URL. Package local resources
+    inside KMZ archives so they remain available when sharing the project.
+    """
+    url = url.strip() if url else None
+    data = data.strip() if data else None
+    if not url and not data:
+        raise ValueError("Provide a KML/KMZ document or URL.")
+    layer = _layer_base(name, "3d-tiles", **style)
+    layer["source"] = {
+        "type": "3d-tiles",
+        "sourceId": layer["id"],
+        **({"kmlData": data} if data else {"url": url}),
+    }
+    if source_path:
+        layer["sourcePath"] = source_path
+    layer["metadata"] = {
+        "sourceKind": "cesium-kml",
+        "externalNativeLayer": True,
+        "identifiable": False,
+    }
     return layer
 
 
@@ -1919,6 +1955,12 @@ PUBLISHABLE_PLUGIN_SETTINGS: dict[str, tuple[str, ...] | None] = {
     # shared Time Slider layers impossible to reconstruct. The retained value
     # is still recursively credential-scrubbed by the caller.
     "maplibre-gl-time-slider": None,
+    # Feed toggles (one boolean per feed) plus a numeric clock speed — no URLs,
+    # no keys, nothing user-authored. Listed as a whole blob rather than by key
+    # because the feed set grows with every new feed; an enumerated list would
+    # silently start counting each new toggle as a credential. The retained
+    # value is still recursively credential-scrubbed by the caller.
+    "gods-eye-view": None,
 }
 
 # Plugins the app activates by default (``activeByDefault: true`` in

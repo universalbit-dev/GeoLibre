@@ -25,6 +25,9 @@ export function installCesiumInteractions(
   let lastPointer: Cartesian2 | null = null;
   let frame = 0;
   let moving = false;
+  const setIdentifyCursor = (active: boolean) => {
+    viewer.canvas.style.cursor = active ? "crosshair" : "";
+  };
   const publishPointer = (point: Cartesian2 | null) => {
     const state = useAppStore.getState();
     const pointer = point ? engine.readPointerAtScreen(point) : null;
@@ -51,7 +54,7 @@ export function installCesiumInteractions(
     Object.assign(box.style, {
       position: "absolute",
       zIndex: "10",
-      maxWidth: "min(520px, 90%)",
+      maxWidth: "min(280px, 80%)",
       maxHeight: "60%",
       overflow: "auto",
       padding: "10px",
@@ -73,8 +76,19 @@ export function installCesiumInteractions(
     }
     box.append(content);
     host.append(box);
-    box.style.left = `${Math.max(0, Math.min(point.x + 12, host.clientWidth - box.offsetWidth))}px`;
-    box.style.top = `${Math.max(0, Math.min(point.y + 12, host.clientHeight - box.offsetHeight))}px`;
+    const gap = 12;
+    const right = point.x + gap;
+    const below = point.y + gap;
+    box.style.left = `${
+      right + box.offsetWidth <= host.clientWidth
+        ? right
+        : Math.max(0, point.x - gap - box.offsetWidth)
+    }px`;
+    box.style.top = `${
+      below + box.offsetHeight <= host.clientHeight
+        ? below
+        : Math.max(0, point.y - gap - box.offsetHeight)
+    }px`;
     return box;
   };
   handler.setInputAction((event: { endPosition: Cartesian2 }) => {
@@ -137,6 +151,7 @@ export function installCesiumInteractions(
       if (target !== IDENTIFY_ALL_LAYERS_ID) break;
     }
     if (content.childElementCount) popup = place(content, event.position, false);
+    else state.selectFeature(null);
   }, C.ScreenSpaceEventType.LEFT_CLICK);
   const selection = () => {
     const state = useAppStore.getState();
@@ -166,6 +181,9 @@ export function installCesiumInteractions(
     ) {
       clearHover();
       clearPopup();
+    }
+    if (state.identifyLayerId !== prev.identifyLayerId) {
+      setIdentifyCursor(Boolean(state.identifyLayerId));
     }
   });
   const escape = (event: KeyboardEvent) => {
@@ -198,11 +216,13 @@ export function installCesiumInteractions(
   viewer.camera.moveEnd.addEventListener(moveEnd);
 
   selection();
+  setIdentifyCursor(Boolean(useAppStore.getState().identifyLayerId));
   return () => {
     unsubscribe();
     handler.destroy();
     leave();
     clearPopup();
+    setIdentifyCursor(false);
     viewer.canvas.removeEventListener("mouseleave", leave);
     window.removeEventListener("keydown", escape);
     viewer.camera.moveStart.removeEventListener(moveStart);

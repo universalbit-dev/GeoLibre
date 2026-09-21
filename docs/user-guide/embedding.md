@@ -253,7 +253,7 @@ For a ZIP containing files of the same geometry type, assign different styles by
 
 You do not need to author that JSON by hand. Open the vector layer's **Layer actions → Styles → Export GeoLibre URL style** menu. The downloaded `.geolibre.style.json` contains only symbology—not feature data—and its render-layer `source` is already set to the original GeoJSON filename stem. Host the file on a CORS-enabled server and pass its URL as `style` alongside the corresponding `data` URL. For a multi-file ZIP, export each layer's GeoLibre URL style and combine their `layers` and `sources` into one style document; layers without `source` can be used for rules shared by every ZIP member.
 
-The same file can be applied interactively to an existing vector layer through **Layer actions → Styles → Import style (GeoLibre URL / Mapbox GL / SLD / QML)…**. Interactive import ignores the file's query-param `source` binding and applies its supported symbology to the layer you selected, so the data filename does not need to match.
+The same file can be applied interactively to an existing vector layer through **Layer actions → Styles → Import style from file (GeoLibre URL / Mapbox GL / SLD / QML)…**. Interactive import ignores the file's query-param `source` binding and applies its supported symbology to the layer you selected, so the data filename does not need to match.
 
 ### An "Open in GeoLibre" badge
 
@@ -549,8 +549,9 @@ await client.setRenderer("cesium");
 const renderer = await client.getRenderer();
 ```
 
-Both methods accept or return `"maplibre"` or `"cesium"`. The change event reports
+Both methods accept or return `"maplibre"`, `"mapbox"`, `"cesium"`, or
+`"arcgis"`. The change event reports
 the selected renderer. `setRenderer` acknowledges the selection; the new canvas
 mounts asynchronously. Wait for the next `ready` event before issuing camera or
-capture commands. `exportImage()` supports either renderer and waits for its
+capture commands. `exportImage()` supports all four renderers and waits for the
 visible layers to settle before returning a PNG data URL.

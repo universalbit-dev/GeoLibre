@@ -7,8 +7,11 @@ import type {
   StoryChapterAnimation,
   StoryChapterLocation,
 } from "@geolibre/core";
-import type { FeatureCollection, Geometry } from "geojson";
+import type { FeatureCollection, Geometry, Point, Polygon } from "geojson";
 import type * as maplibregl from "maplibre-gl";
+
+/** Shared search highlight color across rendering engines. */
+export const SEARCH_HIGHLIGHT_COLOR = "#ef4444";
 
 /**
  * The renderer-neutral surface the app drives a map through (issue #2260).
@@ -54,8 +57,8 @@ export interface MapEngine {
 
   // ------------------------------------------------------------------- camera
 
-  /** Place the camera at `view` immediately, without animation. */
-  applyView(view: MapViewState): void;
+  /** Place the camera at `view` without animation, resolving after asynchronous engines settle. */
+  applyView(view: MapViewState): void | Promise<void>;
   /** Animate the camera to `view` with a short ease. */
   easeToView(view: MapViewState): void;
   /** The camera's current position, in the store's engine-neutral shape. */
@@ -145,6 +148,8 @@ export interface MapEngine {
     options?: { fit?: boolean },
   ): void;
   clearFeatureHighlight(): void;
+  /** Draw a temporary search marker or cell outline; dispose clears only this result. */
+  showSearchResult(geometry: Point | Polygon): () => void;
   /**
    * Drop a draggable pin for the user to position, returning a teardown
    * function. Requires {@link MapEngineCapabilities.onMapDrawing}; engines
@@ -161,7 +166,17 @@ export interface MapEngine {
   getRenderSurface(): MapRenderSurface | null;
   getRenderStatus(): { pending: string[]; errors: string[] };
   captureImage(): Promise<Blob>;
-  onCameraIdle(listener: () => void): () => void;
+  /** Subscribe to primary-button map clicks in geographic coordinates. */
+  onMapClick(listener: (lngLat: [number, number]) => void): () => void;
+  /** Whether the camera is currently moving or animating. */
+  isCameraMoving(): boolean;
+  /** Subscribe to camera changes while the view is moving. */
+  onCameraMove(listener: () => void): () => void;
+  /**
+   * Subscribe to the camera settling. `storyCamera` marks a settle that ends a
+   * story chapter or chapter-preview move, which is scripted, not navigation.
+   */
+  onCameraIdle(listener: (event?: CameraIdleEvent) => void): () => void;
   stopCamera(): void;
   suspendNavigation(): () => void;
 
@@ -242,6 +257,15 @@ export interface MapEngineCapabilities {
    * overlays — layers whose pixels something other than the engine draws.
    */
   readonly customLayers: boolean;
+  /**
+   * The engine hosts deck.gl's `MapboxOverlay` (`@deck.gl/mapbox`), so the
+   * shared interleaved deck overlay and everything drawn through it — Deck.gl
+   * Layers, glTF models, DuckDB query results, 3D Tiles, LiDAR — has a map to
+   * bind to. Narrower than {@link customLayers}: Mapbox GL JS is that
+   * overlay's native host without exposing a MapLibre map or hosting MapLibre
+   * `CustomLayerInterface` layers.
+   */
+  readonly deckOverlay: boolean;
   /** 3D terrain can be enabled and exaggerated. */
   readonly terrain: boolean;
   /** {@link MapEngine.identifyFeatures} can return features. */
@@ -271,6 +295,7 @@ export const MAPLIBRE_CAPABILITIES: MapEngineCapabilities = Object.freeze({
   styleSpec: true,
   nativeMapInstance: true,
   customLayers: true,
+  deckOverlay: true,
   terrain: true,
   picking: true,
   onMapDrawing: true,
@@ -311,6 +336,11 @@ export interface ManualPlacementOptions {
  * reports them: `west < east` always, and a span across the antimeridian
  * carries `east > 180` instead of inverting the pair.
  */
+/** Details of a camera-idle notification; engines that can't tell omit it. */
+export interface CameraIdleEvent {
+  storyCamera: boolean;
+}
+
 export type MapExtent = [west: number, south: number, east: number, north: number];
 
 export interface MapRenderSurface {
@@ -318,7 +348,8 @@ export interface MapRenderSurface {
   getContainer(): HTMLElement;
   getBearing(): number;
   project(location: [number, number]): { x: number; y: number };
-  unproject(point: [number, number]): { lng: number; lat: number };
+  /** Convert a canvas point to degrees, or return `null` when it has no map location. */
+  unproject(point: [number, number]): { lng: number; lat: number } | null;
   redraw(): void;
 }
 
@@ -347,3 +378,59 @@ export type BuiltInMapControl =
   | "logo"
   | "maptoolkit-logo"
   | "layer-control";
+
+/**
+ * The paint properties a story-map fade drives, per style layer type. Both 2D
+ * engines apply a chapter's transient layer opacity through these.
+ */
+export const STORY_OPACITY_PAINT_PROPERTIES: Record<string, string[]> = {
+  background: ["background-opacity"],
+  // A point's outline fades with its fill so story playback can fully hide a
+  // circle layer; without the stroke property a faded-out point still renders
+  // as a hollow ring (#934).
+  circle: ["circle-opacity", "circle-stroke-opacity"],
+  fill: ["fill-opacity"],
+  "fill-extrusion": ["fill-extrusion-opacity"],
+  heatmap: ["heatmap-opacity"],
+  hillshade: ["hillshade-exaggeration"],
+  line: ["line-opacity"],
+  raster: ["raster-opacity"],
+  symbol: ["icon-opacity", "text-opacity"],
+};
+
+/**
+ * Which built-in controls a fresh map shows, and where. Every engine starts
+ * from these so the Controls menu's checkboxes (seeded from the same table)
+ * agree with the map whichever renderer is primary; the Mapbox engine mounts
+ * the same set as MapLibre and only skips the ids it cannot host.
+ */
+export const DEFAULT_BUILT_IN_CONTROL_VISIBILITY: Record<BuiltInMapControl, boolean> = {
+  navigation: false,
+  fullscreen: true,
+  compass: true,
+  geolocate: false,
+  globe: true,
+  terrain: false,
+  scale: true,
+  attribution: true,
+  logo: false,
+  "maptoolkit-logo": false,
+  "layer-control": true,
+};
+
+export const DEFAULT_BUILT_IN_CONTROL_POSITIONS: Record<
+  BuiltInMapControl,
+  maplibregl.ControlPosition
+> = {
+  navigation: "top-right",
+  fullscreen: "top-right",
+  compass: "top-right",
+  geolocate: "top-right",
+  globe: "top-right",
+  terrain: "top-right",
+  scale: "bottom-left",
+  attribution: "bottom-right",
+  logo: "bottom-left",
+  "maptoolkit-logo": "bottom-left",
+  "layer-control": "top-right",
+};

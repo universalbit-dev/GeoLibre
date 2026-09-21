@@ -1439,3 +1439,40 @@ def test_layer_set_popup_bumps_the_sync_sequence(m):
     seq = m._seq
     layer.set_popup(["a"])
     assert m._seq > seq
+
+
+def test_mapbox_renderer_roundtrip(m, tmp_path):
+    """Mapbox survives project save/load and mixed renderer split views."""
+    from geolibre import Map
+
+    m.set_renderer("mapbox")
+    m.set_map_layout(1, 2, view_kinds=["mapbox", "cesium"])
+    assert m.get_renderer() == "mapbox"
+    pane = m.project["secondaryMapViews"][0]
+    m.set_renderer("mapbox", pane_id=pane["id"])
+    path = tmp_path / "mapbox.geolibre.json"
+    m.save_project(path)
+    reopened = Map(renderer="mapbox")
+    reopened.load_project(path)
+    assert reopened.get_renderer() == "mapbox"
+    assert reopened.get_renderer(pane_id=pane["id"]) == "mapbox"
+
+
+def test_arcgis_renderer_roundtrip(m, tmp_path):
+    """ArcGIS survives project save/load and mixed renderer split views."""
+    from geolibre import Map
+
+    m.set_renderer("arcgis")
+    m.set_map_layout(1, 3, view_kinds=["arcgis", "maplibre", "cesium"])
+    assert m.get_renderer() == "arcgis"
+    maplibre_pane, cesium_pane = m.project["secondaryMapViews"]
+    m.set_renderer("arcgis", pane_id=cesium_pane["id"])
+    path = tmp_path / "arcgis.geolibre.json"
+    m.save_project(path)
+    reopened = Map(renderer="arcgis")
+    reopened.load_project(path)
+    # A mixed layout survives: the primary and one pane on ArcGIS, the other
+    # pane still on MapLibre.
+    assert reopened.get_renderer() == "arcgis"
+    assert reopened.get_renderer(pane_id=maplibre_pane["id"]) == "maplibre"
+    assert reopened.get_renderer(pane_id=cesium_pane["id"]) == "arcgis"

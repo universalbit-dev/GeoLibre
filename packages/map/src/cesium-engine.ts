@@ -1,3 +1,4 @@
+import { SEARCH_HIGHLIGHT_COLOR } from "./map-engine";
 import {
   useAppStore,
   type GeoLibreLayer,
@@ -7,8 +8,8 @@ import {
   type StoryChapterAnimation,
   type StoryChapterLocation,
 } from "@geolibre/core";
-import type { Cartesian2, CesiumWidget } from "@cesium/engine";
-import type { FeatureCollection } from "geojson";
+import type { Cartesian2, CesiumWidget, PointPrimitiveCollection } from "@cesium/engine";
+import type { FeatureCollection, Point, Polygon } from "geojson";
 import type * as maplibregl from "maplibre-gl";
 import {
   applyMapViewToCamera,
@@ -31,7 +32,7 @@ import { TerrariumTerrainProvider } from "./cesium-terrarium";
 import { registerCogDemSource, type CogDemSourceRegistration } from "./cog-dem-source";
 import type { MapRenderSurface } from "./map-engine";
 import type { ExtentDrawingOptions, MapExtent } from "./map-engine";
-import { CesiumLayerSync } from "./cesium-layer-sync";
+import { CesiumLayerSync, type MovingPointFeatureDescription } from "./cesium-layer-sync";
 import { getLayerBounds } from "./geojson-loader";
 import type {
   BuiltInMapControl,
@@ -54,8 +55,9 @@ type CesiumNs = typeof import("@cesium/engine");
  *   primitives, not a Mapbox Style document, and there is no `maplibregl.Map`
  *   behind it. Everything that edits paint properties or reads the MapLibre
  *   canvas stays 2D-only.
- * - `customLayers`: a MapLibre `CustomLayerInterface` is a callback into
- *   MapLibre's own WebGL pass; deck.gl's MapLibre interop is the same shape.
+ * - `customLayers` / `deckOverlay`: a MapLibre `CustomLayerInterface` is a
+ *   callback into MapLibre's own WebGL pass, and deck.gl's `MapboxOverlay` is
+ *   the same shape; neither has a Cesium interop.
  *
  * `terrain: true` is the flag worth noting in the other direction — terrain is
  * native on the globe, and the old `primaryRenderer === "cesium"` gates disabled
@@ -65,6 +67,7 @@ export const CESIUM_CAPABILITIES: MapEngineCapabilities = Object.freeze({
   styleSpec: false,
   nativeMapInstance: false,
   customLayers: false,
+  deckOverlay: false,
   terrain: true,
   picking: true,
   onMapDrawing: true,
@@ -109,8 +112,40 @@ const EASE_SECONDS = 0.5;
 const RESET_SECONDS = 1;
 /** `MapController.flyTo` and `MapController.fitBounds` both use 800 ms. */
 const FLY_SECONDS = 0.8;
+/** Cursor aperture for tiny/moving Cesium primitives, in CSS pixels. */
+const FEATURE_PICK_APERTURE_PX = 12;
 /** Zoom floor when framing a point-sized extent; matches MapController.fitBounds. */
 const POINT_FIT_ZOOM = 14;
+
+/**
+ * The shortest longitude interval covering `longitudes`, in the `[west, east]`
+ * form {@link CesiumEngine.fitBounds} reads: `west` greater than `east` means
+ * the interval crosses the antimeridian, the repo-wide convention.
+ *
+ * A plain min/max reads a pair at 179° and −179° as 358° apart and frames
+ * almost the whole globe instead of the two-degree cluster. The enclosing arc
+ * is instead the complement of the widest gap between neighbouring longitudes:
+ * the one stretch of the circle nothing selected sits in is the one to leave
+ * out. Measuring from any single member instead — the first, say — only finds
+ * the minimum while the answer is under 180° wide, and reports 340° for a
+ * three-point spread whose true arc is 190°.
+ */
+function shortestLongitudeInterval(longitudes: readonly number[]): [number, number] {
+  const sorted = longitudes.map(normalizeBearing).sort((a, b) => a - b);
+  if (sorted.length === 1) return [sorted[0], sorted[0]];
+  // Start from the gap that wraps the antimeridian, then the ordinary ones.
+  let widest = sorted[0] + 360 - sorted[sorted.length - 1];
+  let before = sorted.length - 1;
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const gap = sorted[i + 1] - sorted[i];
+    if (gap > widest) {
+      widest = gap;
+      before = i;
+    }
+  }
+  // The arc runs from the longitude just after the gap to the one just before.
+  return [sorted[(before + 1) % sorted.length], sorted[before]];
+}
 
 /**
  * The globe's native scene, for the handful of plugins that drive Cesium
@@ -147,6 +182,12 @@ export interface CesiumSceneHandle {
   readonly primary: boolean;
   /** Ask the scene to draw a frame (a no-op outside request-render mode). */
   requestRender(): void;
+  /** Connect a plugin-owned moving point batch to layer identify/selection. */
+  registerMovingPointLayer(
+    layerId: string,
+    collection: PointPrimitiveCollection,
+    descriptions?: readonly MovingPointFeatureDescription[],
+  ): () => void;
   /**
    * The camera in the store's engine-neutral shape (`MapEngine.readView`), so
    * a plugin can seed from the current view without the camera maths.
@@ -369,7 +410,7 @@ export class CesiumEngine implements MapEngine {
 
   // ------------------------------------------------------------------- camera
 
-  applyView(view: MapViewState): void {
+  applyView(view: MapViewState): void | Promise<void> {
     const viewer = this.live();
     if (!viewer || this.isMorphing()) return;
     this.lastApplied = view;
@@ -377,6 +418,13 @@ export class CesiumEngine implements MapEngine {
     this.userOwnsCamera = false;
     this.lastGroundHeight = groundHeightAt(this.Cesium, viewer, view.center[0], view.center[1]);
     applyMapViewToCamera(this.Cesium, viewer, view);
+    return new Promise((resolve) => {
+      const remove = viewer.scene.postRender.addEventListener(() => {
+        remove();
+        resolve();
+      });
+      viewer.scene.requestRender();
+    });
   }
 
   readView(): MapViewState {
@@ -717,7 +765,12 @@ export class CesiumEngine implements MapEngine {
       return [];
     const results: IdentifiedFeature[] = [];
     const seen = new Set<string>();
-    for (const picked of viewer.scene.drillPick(point)) {
+    for (const picked of viewer.scene.drillPick(
+      point,
+      undefined,
+      FEATURE_PICK_APERTURE_PX,
+      FEATURE_PICK_APERTURE_PX,
+    )) {
       const entity = picked?.id ?? picked?.primitive?.id;
       if (!entity || typeof entity !== "object") continue;
       const feature = this.layerSync.resolveFeature(entity);
@@ -738,7 +791,34 @@ export class CesiumEngine implements MapEngine {
     if (!this.live()) return;
     const ids = featureId === null ? [] : Array.isArray(featureId) ? featureId : [featureId];
     this.layerSync.highlight(layer?.id, ids);
-    if (!options.fit || !layer?.geojson || !ids.length) return;
+    if (!options.fit || !layer || !ids.length) return;
+    // CZML/KML entities are time-dynamic. Their materialized GeoJSON table row
+    // is only a stable attribute anchor, so fitting that point would dive to an
+    // obsolete ground location while the satellite remains hundreds of
+    // kilometres away. Frame the live Cesium entity positions instead.
+    const livePositions = this.layerSync.featurePositions(layer.id, ids);
+    if (livePositions.length > 0) {
+      const coordinates = livePositions.map((position) => {
+        const cartographic = this.Cesium.Cartographic.fromCartesian(position);
+        return [
+          this.Cesium.Math.toDegrees(cartographic.longitude),
+          this.Cesium.Math.toDegrees(cartographic.latitude),
+        ] as const;
+      });
+      if (coordinates.length === 1) {
+        // Frame the sub-satellite point at a regional scale. This keeps the
+        // moving object, its close-range label, and the Earth beneath it in the
+        // same view; targeting the elevated Cartesian directly can put the
+        // globe behind the camera.
+        this.animateTo({ center: [...coordinates[0]], zoom: 4, bearing: 0, pitch: 0 }, FLY_SECONDS);
+      } else {
+        const latitudes = coordinates.map(([, latitude]) => latitude);
+        const [west, east] = shortestLongitudeInterval(coordinates.map(([longitude]) => longitude));
+        this.fitBounds([west, Math.min(...latitudes), east, Math.max(...latitudes)]);
+      }
+      return;
+    }
+    if (!layer.geojson) return;
     const selected = new Set(ids);
     const features = layer.geojson.features.filter((feature, index) =>
       selected.has(String(feature.id ?? index)),
@@ -797,8 +877,7 @@ export class CesiumEngine implements MapEngine {
       },
       unproject: ([x, y]) => {
         const location = pickDrawingLocation(C, viewer, { x, y });
-        if (!location) throw new Error("The requested point is outside the globe");
-        return { lng: location[0], lat: location[1] };
+        return location ? { lng: location[0], lat: location[1] } : null;
       },
     };
     return this.renderSurface;
@@ -817,6 +896,32 @@ export class CesiumEngine implements MapEngine {
 
   captureImage(): Promise<Blob> {
     return captureEngineImage(this);
+  }
+
+  onMapClick(listener: (lngLat: [number, number]) => void): () => void {
+    const viewer = this.live();
+    if (!viewer) return () => {};
+    const handler = new this.Cesium.ScreenSpaceEventHandler(viewer.canvas);
+    handler.setInputAction((event: { position: { x: number; y: number } }) => {
+      const location = pickDrawingLocation(this.Cesium, viewer, event.position);
+      if (location) listener(location);
+    }, this.Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    return () => {
+      if (!handler.isDestroyed()) handler.destroy();
+    };
+  }
+
+  isCameraMoving(): boolean {
+    return this.cameraMoving;
+  }
+
+  onCameraMove(listener: () => void): () => void {
+    const viewer = this.live();
+    if (!viewer) return () => {};
+    const onRender = () => {
+      if (this.cameraMoving) listener();
+    };
+    return viewer.scene.preRender.addEventListener(onRender);
   }
 
   onCameraIdle(listener: () => void): () => void {
@@ -871,6 +976,59 @@ export class CesiumEngine implements MapEngine {
       east < west ? east + 360 : east,
       degrees(rectangle.north),
     ];
+  }
+
+  showSearchResult(geometry: Point | Polygon): () => void {
+    const viewer = this.live();
+    if (!viewer) return () => {};
+    const C = this.Cesium;
+    const color = C.Color.fromCssColorString(SEARCH_HIGHLIGHT_COLOR);
+    const primitives: unknown[] = [];
+    if (geometry.type === "Point") {
+      const points = new C.PointPrimitiveCollection();
+      points.add({
+        position: C.Cartesian3.fromDegrees(geometry.coordinates[0], geometry.coordinates[1]),
+        color,
+        pixelSize: 12,
+        outlineColor: C.Color.WHITE,
+        outlineWidth: 2,
+      });
+      primitives.push(viewer.scene.primitives.add(points));
+    } else {
+      const positions = geometry.coordinates[0].map((p) => C.Cartesian3.fromDegrees(p[0], p[1]));
+      const fill = new C.Primitive({
+        geometryInstances: new C.GeometryInstance({
+          geometry: new C.PolygonGeometry({
+            polygonHierarchy: new C.PolygonHierarchy(positions),
+            perPositionHeight: true,
+          }),
+          attributes: { color: C.ColorGeometryInstanceAttribute.fromColor(color.withAlpha(0.15)) },
+        }),
+        appearance: new C.PerInstanceColorAppearance({
+          flat: true,
+          translucent: true,
+          closed: true,
+        }),
+      });
+      const outline = new C.Primitive({
+        geometryInstances: new C.GeometryInstance({
+          geometry: new C.PolylineGeometry({ positions, width: 2 }),
+          attributes: { color: C.ColorGeometryInstanceAttribute.fromColor(color) },
+        }),
+        appearance: new C.PolylineColorAppearance({ translucent: true }),
+      });
+      primitives.push(viewer.scene.primitives.add(fill), viewer.scene.primitives.add(outline));
+    }
+    const dispose = () => {
+      if (!this.extentDisposers.delete(dispose)) return;
+      if (!viewer.isDestroyed()) {
+        for (const primitive of primitives) viewer.scene.primitives.remove(primitive);
+        viewer.scene.requestRender();
+      }
+    };
+    this.extentDisposers.add(dispose);
+    viewer.scene.requestRender();
+    return dispose;
   }
 
   showExtent(extent: MapExtent): () => void {
@@ -1137,6 +1295,8 @@ export class CesiumEngine implements MapEngine {
       requestRender: () => {
         if (!viewer.isDestroyed()) viewer.scene.requestRender();
       },
+      registerMovingPointLayer: (layerId, collection, descriptions) =>
+        this.layerSync.registerMovingPointLayer(layerId, collection, descriptions),
       readView: () => this.readView(),
     };
   }

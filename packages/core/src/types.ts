@@ -1258,6 +1258,14 @@ export interface GeoLibreLayer {
   /** Transient MapLibre expression applied by the iframe embed API. */
   embedFilter?: unknown[];
   /**
+   * Project-persisted boolean MapLibre expression that narrows the features
+   * rendered for this layer. Unlike a selection, this leaves the source data
+   * intact and keeps non-matching features hidden until the filter is cleared.
+   * It is composed with transient filters, quick filters, and rule visibility
+   * by the map renderers.
+   */
+  filterExpression?: unknown[];
+  /**
    * Data-driven filter controls authored in the layer's Quick Filters section
    * (issue #2114). Unlike {@link timeFilter} and {@link embedFilter} this is
    * persisted control *state*, not a compiled expression: `@geolibre/map`
@@ -1416,13 +1424,15 @@ export interface MapGridLayout {
  * `"maplibre"` is the 2D MapLibre GL map that owns the app's plugin, styling,
  * and deck.gl integrations. `"cesium"` is the 3D globe (see `CesiumCanvas`),
  * which renders the same shared store state — camera, basemap, layers, group
- * effects — through CesiumJS.
+ * effects — through CesiumJS. `"mapbox"` is Mapbox GL JS and `"arcgis"` the
+ * ArcGIS Maps SDK for JavaScript, loaded from Esri's CDN at runtime (see
+ * `ArcgisCanvas`); both draw the same store state through their own engines.
  *
  * Used both for secondary panes ({@link SecondaryMapView.viewKind}) and for the
  * primary workspace ({@link GeoLibreProject.primaryRenderer}), so the two never
  * drift apart.
  */
-export type MapRendererKind = "maplibre" | "cesium";
+export type MapRendererKind = "maplibre" | "cesium" | "mapbox" | "arcgis";
 
 /**
  * The engine that draws the primary map area when a project says nothing. The
@@ -1603,6 +1613,16 @@ export interface MapPreferences {
   showPointerElevation: boolean;
   /** Whether the built-in 3D terrain control and terrain surface are enabled. */
   terrainEnabled: boolean;
+  /** Mapbox-only style. New projects use Streets; absent follows the shared basemap. */
+  mapboxStyleUrl?: string;
+  /**
+   * ArcGIS-only basemap: an Esri basemap style id (`arcgis/streets`,
+   * `arcgis/imagery`, `osm/standard`, ...). New projects use Streets. Absent
+   * follows the shared basemap, translated to tiles the SDK can draw; the id
+   * is also set aside when no ArcGIS API key is configured, since Esri's
+   * basemap styles service requires one.
+   */
+  arcgisBasemap?: string;
   /** Cesium imagery override; absent follows the shared project basemap. */
   cesiumBasemap?: import("./cesium-imagery").CesiumBasemapId;
   /**
@@ -1683,6 +1703,12 @@ export const DEFAULT_PROJECT_PREFERENCES: ProjectPreferences = {
     showPointerElevation: false,
     terrainEnabled: false,
     coordinateFormat: "dd",
+    mapboxStyleUrl: "mapbox://styles/mapbox/standard",
+    arcgisBasemap: "arcgis/streets",
+    // With an Ion token this is the globe's photographic default. The
+    // availability gate transparently falls back to the project basemap when
+    // no token is configured.
+    cesiumBasemap: "bing-aerial",
   },
   environmentVariables: [],
   geocoding: {

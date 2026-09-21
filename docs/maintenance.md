@@ -76,6 +76,24 @@ suite.
   `e2e/blend-modes.spec.ts` asserts real pixels. Run both on a bump.
 
   See [Adding a blend mode](#adding-a-blend-mode) before extending the list.
+- **`DEFAULT_MARKER_OFFSET_Y`**
+  (`apps/geolibre-desktop/src/components/storymap/storymap-engine.ts`) mirrors the
+  `-14` px vertical offset `maplibregl.Marker` applies to its default pin.
+  `createStoryMapMarker` (also reused by Field Collection's capture marker in
+  `apps/geolibre-desktop/src/lib/field-collection-map.ts`) positions that pin by
+  hand on every engine (Mapbox, Cesium, ArcGIS, and MapLibre alike), so if a bump changes the default pin's
+  anchor or offset, story markers drift off their coordinate with no error.
+  Compare with `defaultMarker.ts`/`marker.ts` upstream and play a story on a
+  non-MapLibre renderer.
+
+### `@deck.gl/mapbox` and `@deck.gl/maplibre`
+
+`bridgeArcgisDeckControl` (`packages/plugins/src/plugins/arcgis-deck/control-adapter.ts`)
+reads each overlay's private `_props` field so ArcGIS can transfer its initial
+layers into a native `ArcgisDeckOverlay` without mounting the MapLibre control.
+The cast hides upstream changes from TypeScript. After either deck.gl package is
+bumped, run `tests/arcgis-control-adapters.test.ts` and confirm the overlay still
+exposes `_props` with the initial `DeckProps` object.
 
 ### `@maplibre/maplibre-gl-style-spec`
 
@@ -347,6 +365,46 @@ renamed view-model observable and the 0x0-button case of a missing stylesheet.
 Neither catches the rest of the CSS regression or the bundle-size one — check
 those by eye and in the build output.
 
+### ArcGIS Maps SDK for JavaScript — loaded from Esri's CDN
+
+The ArcGIS renderer (`docs/arcgis-renderer.md`) has **no npm dependency**.
+`packages/map/src/arcgis-sdk.ts` imports the SDK's ES modules from
+`https://js.arcgis.com/<ARCGIS_SDK_VERSION>/@arcgis/core/…` at runtime and
+types the surface it uses by hand, so nothing here is checked by the compiler
+against Esri's declarations. Bumping `ARCGIS_SDK_VERSION` is therefore a
+manual check, not a Dependabot event:
+
+- **Module paths and default exports.** `SDK_MODULES` in `arcgis-sdk.ts` lists
+  every module the engine loads. `tests/arcgis-renderer.test.ts` only checks the
+  assembly against fakes; probe the real CDN (`curl -sI` each URL returns 200)
+  and mount a pane in a browser — a moved module rejects the whole load and the
+  pane shows the error banner. Also check the deck adapter's lazy imports in
+  `packages/plugins/src/plugins/arcgis-deck/overlay.ts`:
+  `layers/Layer`, `views/2d/layers/BaseLayerViewGL2D`, and
+  `views/3d/webgl/RenderNode`. Mount a deck.gl layer in both a 2D MapView and a
+  local SceneView after a version bump; those imports are outside the engine's
+  module registry.
+- **The legacy widgets.** `widgets/Zoom`, `Compass`, `ScaleBar`, `Fullscreen`
+  and `Locate` back the built-in controls. Esri deprecated them in 4.32 in
+  favour of web components and still ships them in 5.x with a console warning
+  each; a release that drops them breaks `setBuiltInControlVisible`. The
+  replacement is the `@arcgis/map-components` CDN build. Attribution already
+  uses the 5.x path: the view draws it while `view.attributionVisible` is on,
+  so the deprecated `Attribution` widget is not loaded.
+- **The ESM CDN notice.** The SDK logs "Only use ES modules from ArcGIS CDN for
+  testing" on load; Esri's documented production path is an npm build, which
+  this renderer deliberately avoids (see the size argument in issue #2421). The
+  AMD CDN (`<script src="https://js.arcgis.com/<version>/">`) is the supported
+  alternative if the ESM CDN is ever withdrawn.
+- **Hit-test attributes.** `GeoJSONLayer` graphics only carry the fields the
+  renderer reads unless `outFields: ["*"]` is set; identify depends on the
+  compiler's `gl__id` field arriving. `e2e/arcgis-renderer.spec.ts` (opt-in,
+  `ARCGIS_API_KEY`) is the check.
+- **CSP and caching.** `https://js.arcgis.com/` is allow-listed in `script-src`
+  and `font-src` in `tauri.conf.json` and `docker/nginx.conf`, and cached by
+  the `geolibre-arcgis-sdk` service-worker rule in `vite.config.ts`. The
+  version is in every URL, so a bump mints new cache entries.
+
 ## Adding a blend mode
 
 **Do not add a blend mode without checking it in the browser.** MapLibre's blend
@@ -436,6 +494,29 @@ the vulnerable code is **unreachable from a GeoLibre runtime path**, and say why
 both counts in the entry. Anything upgradeable gets upgraded instead. Stale entries
 print a warning rather than failing, since the advisory database is a live service
 and a transient omission must not redden an unrelated PR.
+
+When the fix is a scoped `overrides` entry (such as `@loaders.gl/compression` →
+`fflate`), npm 12 accepts it and `npm ls` then checks against the override's
+range. The lockfile still lists the package's own declared dependency (`fflate:
+0.7.4`), though, and npm keeps the old nested copy, so `npm ls` reports it as
+`invalid`. Delete that package's
+nested `node_modules/.../<pkg>` entries from `package-lock.json` (and from
+`node_modules`), then run `npm install` again so it resolves them fresh. Confirm
+with `npm ls <pkg>` before you commit.
+
+If no other package already installs a copy that satisfies the override, npm
+does not fetch one. It leaves the package out of the tree and `npm audit`
+reports 0 vulnerabilities, which looks like a fix but isn't. That is why the
+`texture-compressor` → `image-size@^2.0.4` override needed a hand-written lock
+entry: `version`, `resolved`, `integrity`, `license`, `bin` and `engines`, taken
+from `npm view <pkg>@<version> --json` (npm 12 wraps that output in an array).
+Check a fresh `npm ci` with `npm ls <pkg>` before you commit. That override
+patches GHSA-w3rx-r6r6-pgpr and GHSA-5p2g-fcmc-qvqq, but image-size 2.x takes a
+buffer rather than a path, so texture-compressor's own CLI can no longer read
+image sizes. GeoLibre never runs it: only `@loaders.gl/textures`'
+`encodeImageURLToCompressedTextureURL`, a Node-only encoder, spawns it via
+`npx`. Drop the override once loaders.gl stops depending on texture-compressor
+(4.5.x already makes it a peer).
 
 ## Publishing `@geolibre/core` and `@geolibre/map`
 
