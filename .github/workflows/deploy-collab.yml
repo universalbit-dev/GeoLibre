@@ -23,7 +23,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      - name: Check deploy prerequisites
+        id: prerequisites
+        run: |
+          set -euo pipefail
+          if [[ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" || -z "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ]]; then
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+              echo "::error::CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID must be configured."
+              exit 1
+            fi
+            echo "::warning::Cloudflare deploy secrets are not configured; skipping collab deploy for ${GITHUB_EVENT_NAME}."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
       - name: Deploy to Cloudflare Workers
+        if: steps.prerequisites.outputs.run == 'true'
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
