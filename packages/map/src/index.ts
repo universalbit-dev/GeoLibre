@@ -1,7 +1,17 @@
 export { MapboxCanvas, type MapboxCanvasProps } from "./MapboxCanvas";
 export { ArcgisCanvas, type ArcgisCanvasProps } from "./ArcgisCanvas";
-export { ArcgisEngine, ARCGIS_CAPABILITIES, ARCGIS_DECK_CAPABILITIES } from "./arcgis-engine";
-export { isArcgisSupportedLayer } from "./arcgis-layers";
+export {
+  ArcgisEngine,
+  ARCGIS_CAPABILITIES,
+  ARCGIS_DECK_CAPABILITIES,
+  type ArcgisEngineMessages,
+} from "./arcgis-engine";
+export {
+  arcgisRasterEffect,
+  arcgisUnsupportedStyleSettings,
+  isArcgisSupportedLayer,
+  type ArcgisUnsupportedStyleSetting,
+} from "./arcgis-layers";
 export {
   ARCGIS_BASEMAP_STYLES,
   DEFAULT_ARCGIS_BASEMAP,
@@ -10,7 +20,12 @@ export {
 } from "./arcgis-basemap";
 export { ARCGIS_SDK_CDN, ARCGIS_SDK_HOST, ARCGIS_SDK_VERSION } from "./arcgis-sdk";
 export { MapboxEngine, MAPBOX_CAPABILITIES } from "./mapbox-engine";
-export { isMapboxSupportedLayer, styleUsesUnsupportedSource } from "./mapbox-layers";
+export {
+  isMapboxSupportedLayer,
+  mapboxUnsupportedStyleSettings,
+  styleUsesUnsupportedSource,
+  type MapboxUnsupportedStyleSetting,
+} from "./mapbox-layers";
 export {
   MapCanvas,
   type MapCanvasIdentifyAllLabels,
@@ -36,6 +51,7 @@ export { getPrimaryCesiumControlHost } from "./cesium-control-host";
 // `CesiumCanvas`'s dynamic import exists to keep it off.
 export type { CesiumWidgetControlLabels } from "./cesium-widget-controls";
 export { isCesiumSupportedLayerType } from "./cesium-layer-sync";
+export { classifyLayer, type LayerKind } from "./layer-kind";
 export { arcgisVectorStyle } from "./arcgis-vector-style";
 export {
   CESIUM_CAPABILITIES,
@@ -189,4 +205,5 @@ export {
   type QmlExportResult,
 } from "./qml-export";
 export { applyQmlImport, parseQml, type QmlImportResult } from "./qml-import";
-export { loadMarkerSvgImage } from "./markers";
+export { loadMarkerSvgImage, markerIconSizeValue, renderMarkerCanvas } from "./markers";
+export { setWmsIdentifyFetcher, type WmsIdentifyFetcher } from "./identify-sources";

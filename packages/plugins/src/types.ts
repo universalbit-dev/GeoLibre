@@ -129,7 +129,27 @@ export interface GeoLibreWmsLayerOptions extends GeoLibreTileLayerOptions {
    * sends `CRS` instead of `SRS`; some servers accept only one version.
    */
   version?: string;
+  /**
+   * CRS the tiles are requested in (default `"EPSG:3857"`), for a server that
+   * does not offer Web Mercator: a geographic CRS (`"EPSG:4326"`,
+   * `"EPSG:4258"`, `"EPSG:6706"`, `"CRS:84"` with version 1.3.0) or any other
+   * `"EPSG:<code>"`, e.g. `"EPSG:25832"`. The desktop app redraws these tiles
+   * into Web Mercator; the web build still sends the Web Mercator BBOX, so
+   * such a layer stays blank there. Any other value throws.
+   */
+  crs?: string;
 }
+
+/**
+ * What {@link GeoLibreAppAPI.importLayerStyle} did. `warnings` lists what the
+ * style asked for that GeoLibre could not represent. On failure, `invalid`
+ * means the text is not a style in any format read, `no-match` that it parsed
+ * but describes no symbology the layer can wear, `unsupported-layer` that the
+ * layer is not a vector layer (only GeoJSON and vector-tile layers take one).
+ */
+export type GeoLibreImportLayerStyleResult =
+  | { ok: true; warnings: string[] }
+  | { ok: false; reason: "invalid" | "no-match" | "unsupported-layer"; warnings: string[] };
 
 /** Overture Maps themes available through the host's official PMTiles source. */
 export type GeoLibreOvertureTheme = OvertureTheme;
@@ -213,6 +233,11 @@ export interface GeoLibreCogLayerOptions {
   opacity?: number;
   /** Insert the new layer directly beneath the layer with this id. */
   beforeLayerId?: string;
+  /**
+   * Fit the map to the COG once it loads (default true). Pass `false` for a
+   * global layer, where fitting would throw away the user's view.
+   */
+  zoomTo?: boolean;
 }
 
 /**
@@ -355,6 +380,20 @@ export interface GeoLibreLayerSummary {
   opacity: number;
 }
 
+/**
+ * A Layers-panel group (folder) as plugins see it. `parentId` is the enclosing
+ * group's id, or `null` for a group at the panel root, so the array a host
+ * returns describes the whole folder tree and not just its top level.
+ */
+export interface GeoLibreLayerGroupSummary {
+  id: string;
+  name: string;
+  parentId: string | null;
+  visible: boolean;
+  opacity: number;
+  collapsed: boolean;
+}
+
 export interface GeoLibreRasterWindowOptions {
   bounds: [number, number, number, number];
   width?: number;
@@ -409,6 +448,19 @@ export interface GeoLibreAppAPI {
   addGeoJsonLayer: (name: string, data: FeatureCollection, sourcePath?: string) => string;
   listLayers?: () => GeoLibreLayerSummary[];
   getLayerFeatures?: (layerId: string) => Feature<Geometry | null>[];
+  /**
+   * Apply a style written in another format to a layer, like the Layers
+   * panel's "Import style": an OGC SLD, a QGIS QML or a Mapbox GL style JSON,
+   * detected from the content. The style is merged over the layer's current
+   * one and saved with the project. Only GeoJSON and vector-tile layers take a
+   * style, as in the Layers panel; any other layer is left untouched with
+   * `reason: "unsupported-layer"`. Accepts any such layer id, not only the
+   * plugin's own; throws for an unknown id.
+   *
+   * Lets a plugin that adds features from a web service dress them as the
+   * service does, e.g. with the SLD a GeoServer returns for WMS `GetStyles`.
+   */
+  importLayerStyle?: (layerId: string, text: string) => GeoLibreImportLayerStyleResult;
   getSelectedFeatures?: () => Feature<Geometry | null>[];
   getSelectedLayerId?: () => string | null;
   readRasterWindow?: (
@@ -620,8 +672,27 @@ export interface GeoLibreAppAPI {
    * creating a second group with the same name. No-op if the group is gone.
    */
   moveLayersToGroup?: (layerIds: string[], groupId: string | null) => void;
+  /**
+   * Nest a Layers-panel group inside another one, or lift it back to the panel
+   * root with a null parent id. The group-of-groups counterpart of
+   * {@link moveLayersToGroup}, so a plugin can build the same nested folders a
+   * user can build by hand in the Layers panel.
+   *
+   * No-op when either id is unknown, when the group is already in that parent,
+   * or when the move would make a group its own ancestor (the host refuses the
+   * cycle rather than corrupting the tree).
+   */
+  moveLayerGroupToGroup?: (id: string, parentId: string | null) => void;
   /** Remove a Layers-panel group without removing its child layers. */
   removeLayerGroup?: (id: string) => void;
+  /**
+   * Every Layers-panel group, with the parent link that spells out the folder
+   * tree. The read half of the group API: a plugin needs it to address a group
+   * it did not create itself, since {@link addLayerGroup} is otherwise the only
+   * source of group ids. The order is the host's own group order, not the
+   * panel's (which re-orders a group after its parent for display).
+   */
+  listLayerGroups?: () => GeoLibreLayerGroupSummary[];
   fitBounds?: (bounds: [number, number, number, number]) => void;
   /**
    * The geographic extent the primary map currently shows, as
@@ -643,6 +714,18 @@ export interface GeoLibreAppAPI {
   getMapRenderer?: () => MapRendererKind;
   /** Native ArcGIS view; null while another engine is active. */
   getArcgisView?: () => ReturnType<import("@geolibre/map").ArcgisEngine["getView"]>;
+  /**
+   * The MapLibre-shaped map controls receive on the ArcGIS renderer (null
+   * while another engine is active): camera, events, projection and DOM go
+   * through the view, and its style is recorded rather than handed to the SDK.
+   * The host draws what the style holds in two ways: a layer mirrored into
+   * the GeoLibre store is drawn from that store record, and any other GeoJSON
+   * fill, line, circle or text layer is drawn as the host's own graphics (see
+   * "Plugin controls" in docs/arcgis-renderer.md). Raster or vector-tile
+   * sources that are not mirrored, icons and custom layers are not drawn.
+   * Read it through `getControlMap` in `style-map.ts` rather than directly.
+   */
+  getArcgisControlMap?: () => MapLibreMap | null;
   /** Native Mapbox map, available only while Mapbox is the primary renderer. */
   getMapboxMap?: () => ReturnType<import("@geolibre/map").MapboxEngine["getMapboxMap"]>;
   /**
@@ -1182,6 +1265,14 @@ export interface GeoLibrePlugin {
    * panel opens.
    */
   restoresPanelCollapseState?: boolean;
+  /**
+   * Set when the plugin's project state is project *data* rather than a
+   * preference (e.g. point labels): every project load then calls
+   * `applyProjectState`, with `undefined` when the file has no state for the
+   * plugin, so data from the previously open project is not carried over
+   * (and re-saved) into one that never had it.
+   */
+  clearsStateOnProjectLoad?: boolean;
 }
 
 export interface GeoLibreExternalPluginManifest {

@@ -8,6 +8,7 @@ a project produced entirely from Python.
 
 from __future__ import annotations
 
+import base64
 import copy
 import ipaddress
 import json
@@ -16,6 +17,7 @@ import re
 import socket
 import uuid
 import warnings
+import zlib
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
@@ -425,6 +427,15 @@ POPUP_FIELD_KINDS = frozenset({"auto", "text", "number", "date", "link", "image"
 #: Rendering choices for a ``"date"`` field.
 POPUP_DATE_FORMATS = frozenset({"date", "datetime", "time", "iso", "year"})
 
+#: Inclusive bounds for a popup's ``max_width``, in CSS pixels. Mirrors
+#: ``POPUP_MAX_WIDTH_RANGE`` in ``packages/core/src/popup.ts``: the floor is the
+#: popup's own minimum width, the ceiling stops a popup blanketing the map.
+POPUP_MAX_WIDTH_RANGE = (288, 1200)
+
+#: Inclusive bounds for a popup's ``image_height``, in CSS pixels. Mirrors
+#: ``POPUP_IMAGE_HEIGHT_RANGE`` in ``packages/core/src/popup.ts``.
+POPUP_IMAGE_HEIGHT_RANGE = (40, 1200)
+
 #: Built-in marker shapes, plus ``"custom"`` for a caller-supplied SVG.
 MARKER_SHAPES = frozenset(
     {"circle", "square", "triangle", "diamond", "star", "cross", "pin", "custom"}
@@ -442,6 +453,8 @@ _POPUP_CONFIG_KEYS = {
     "titleexpression": "titleExpression",
     "bodyexpression": "bodyExpression",
     "showfeatureid": "showFeatureId",
+    "maxwidth": "maxWidth",
+    "imageheight": "imageHeight",
     "tooltip": "tooltip",
 }
 
@@ -471,6 +484,8 @@ _POPUP_CONFIG_ARGUMENTS = sorted(
         "titleExpression": "title_expression",
         "bodyExpression": "body_expression",
         "showFeatureId": "show_feature_id",
+        "maxWidth": "max_width",
+        "imageHeight": "image_height",
     }.get(value, value)
     for value in set(_POPUP_CONFIG_KEYS.values())
 )
@@ -502,6 +517,41 @@ def normalize_hex_color(value: str) -> str | None:
     if re.fullmatch(r"#[0-9a-f]{3}", token):
         token = "#" + "".join(channel * 2 for channel in token[1:])
     return token if re.fullmatch(r"#[0-9a-f]{6}", token) else None
+
+
+def _popup_pixel_size(name: str, value: Any, bounds: tuple[int, int]) -> int:
+    """Validate a popup pixel size against the range the app renders.
+
+    The app clamps an out-of-range size rather than failing, so an accepted
+    ``max_width=4000`` would be written to the project and drawn at 1200 --
+    a setting that reads one way in the notebook and another on the map.
+    Raising here keeps the two the same.
+
+    Args:
+        name: The argument name, for the error message.
+        value: The caller's size in CSS pixels.
+        bounds: The inclusive ``(minimum, maximum)`` the app honors.
+
+    Returns:
+        The size as a whole number of pixels.
+
+    Raises:
+        ValueError: If the value is not a whole number inside ``bounds``.
+    """
+    low, high = bounds
+    try:
+        size = int(value)
+        exact = size == value
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is what `int(float("inf"))` raises, so without it an
+        # infinite size escapes as an internal error instead of the ValueError
+        # this function documents.
+        exact = False
+    if not exact:
+        raise ValueError(f"{name} must be a whole number of pixels, got {value!r}")
+    if not low <= size <= high:
+        raise ValueError(f"{name} must be between {low} and {high} pixels, got {value!r}")
+    return size
 
 
 def popup_field(
@@ -566,7 +616,8 @@ def popup_field(
         try:
             digits = int(decimals)
             exact = digits == decimals
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # `int(float("inf"))` raises OverflowError, not ValueError.
             exact = False
         if not exact:
             raise ValueError(f"decimals must be a whole number, got {decimals!r}")
@@ -643,6 +694,8 @@ def popup_config(
     title_expression: str | None = None,
     body_expression: str | None = None,
     show_feature_id: bool | None = None,
+    max_width: int | None = None,
+    image_height: int | None = None,
 ) -> dict[str, Any]:
     """Build a layer's ``LayerPopupConfig``.
 
@@ -660,12 +713,20 @@ def popup_config(
         body_expression: MapLibre expression source producing the whole popup
             body as one block of text instead of the field rows.
         show_feature_id: ``False`` drops the synthetic ``id`` row.
+        max_width: Widest the click popup may draw, in CSS pixels
+            (:data:`POPUP_MAX_WIDTH_RANGE`). The viewport still caps it, so a
+            popup never covers the whole map on a small screen.
+        image_height: Tallest an ``"image"`` field's thumbnail may draw inside
+            the popup, in CSS pixels (:data:`POPUP_IMAGE_HEIGHT_RANGE`). A
+            thumbnail keeps its aspect ratio, so raise ``max_width`` too for a
+            landscape photo to use the extra height.
 
     Returns:
         A ``LayerPopupConfig`` dict, empty when nothing was configured.
 
     Raises:
-        ValueError: If a field entry is not a name or a valid field mapping.
+        ValueError: If a field entry is not a name or a valid field mapping, or
+            a size falls outside the range the app renders.
     """
     config: dict[str, Any] = {}
     if click is not None:
@@ -680,6 +741,12 @@ def popup_config(
         config["bodyExpression"] = str(body_expression)
     if show_feature_id is not None:
         config["showFeatureId"] = bool(show_feature_id)
+    if max_width is not None:
+        config["maxWidth"] = _popup_pixel_size("max_width", max_width, POPUP_MAX_WIDTH_RANGE)
+    if image_height is not None:
+        config["imageHeight"] = _popup_pixel_size(
+            "image_height", image_height, POPUP_IMAGE_HEIGHT_RANGE
+        )
     if fields is not None:
         if isinstance(fields, (str, dict)):
             entries = [fields]
@@ -809,7 +876,13 @@ def apply_tooltip(config: dict[str, Any], tooltip: Any) -> dict[str, Any]:
     return config
 
 
-def normalize_popup(popup: Any = None, tooltip: Any = None) -> dict[str, Any] | None:
+def normalize_popup(
+    popup: Any = None,
+    tooltip: Any = None,
+    *,
+    max_width: Any = None,
+    image_height: Any = None,
+) -> dict[str, Any] | None:
     """Coerce the ``popup=``/``tooltip=`` arguments to a ``LayerPopupConfig``.
 
     ``popup`` accepts, in rising order of control: ``True``/``False`` to turn
@@ -817,12 +890,19 @@ def normalize_popup(popup: Any = None, tooltip: Any = None) -> dict[str, Any] | 
     and/or :func:`popup_field` mappings, or a full config mapping whose keys
     are the arguments of :func:`popup_config` (``fields``, ``click``,
     ``hover``, ``title``, ``title_expression``, ``body_expression``,
-    ``show_feature_id``, ``tooltip``) in either snake_case or camelCase.
+    ``show_feature_id``, ``max_width``, ``image_height``, ``tooltip``) in
+    either snake_case or camelCase.
 
     Args:
         popup: The popup specification, or ``None`` for no popup config.
         tooltip: Hover-tooltip shorthand; see :func:`apply_tooltip`. Wins over
             a ``tooltip`` key inside ``popup``.
+        max_width: ``popup_max_width=`` shorthand, in CSS pixels. Wins over a
+            ``max_width`` key inside ``popup``, and configures a popup on its
+            own -- ``popup_max_width=480`` alone still widens the default
+            popup, which is the point of the shorthand.
+        image_height: ``popup_image_height=`` shorthand, in CSS pixels; the
+            same precedence as ``max_width``.
 
     Returns:
         A ``LayerPopupConfig`` dict, or ``None`` when neither argument
@@ -832,7 +912,7 @@ def normalize_popup(popup: Any = None, tooltip: Any = None) -> dict[str, Any] | 
         ValueError: If the specification carries an unknown key or an
             unusable field entry.
     """
-    if popup is None and tooltip is None:
+    if popup is None and tooltip is None and max_width is None and image_height is None:
         return None
 
     inline_tooltip: Any = None
@@ -860,11 +940,33 @@ def normalize_popup(popup: Any = None, tooltip: Any = None) -> dict[str, Any] | 
                 kwargs["body_expression"] = value
             elif mapped == "showFeatureId":
                 kwargs["show_feature_id"] = value
+            elif mapped == "maxWidth":
+                kwargs["max_width"] = value
+            elif mapped == "imageHeight":
+                kwargs["image_height"] = value
             else:
                 kwargs[mapped] = value
+        # Drop the mapping's copy of a size the dedicated argument also carries,
+        # rather than validating a value that is about to be overwritten -- the
+        # same thing `inline_tooltip` gets when `tooltip=` was passed. Left in,
+        # an out-of-range mapping value would raise even though the argument
+        # that wins is perfectly valid.
+        if max_width is not None:
+            kwargs.pop("max_width", None)
+        if image_height is not None:
+            kwargs.pop("image_height", None)
         config = popup_config(**kwargs)
     else:
         config = popup_config(popup)
+
+    # After the mapping form, so the dedicated argument wins over the key of
+    # the same name inside `popup=` -- the same precedence `tooltip` has.
+    if max_width is not None:
+        config["maxWidth"] = _popup_pixel_size("max_width", max_width, POPUP_MAX_WIDTH_RANGE)
+    if image_height is not None:
+        config["imageHeight"] = _popup_pixel_size(
+            "image_height", image_height, POPUP_IMAGE_HEIGHT_RANGE
+        )
 
     return apply_tooltip(config, tooltip if tooltip is not None else inline_tooltip)
 
@@ -994,11 +1096,17 @@ def marker_style(
 
 
 def _layer_base(name: str, layer_type: str, **style: Any) -> dict[str, Any]:
-    # `popup` and `tooltip` ride in with the style overrides so every add_*
-    # builder accepts them without threading two more arguments through each
-    # signature, but the popup config is a top-level layer key -- left in
-    # `style` it would land somewhere the app never reads.
-    popup = normalize_popup(style.pop("popup", None), style.pop("tooltip", None))
+    # `popup`, `tooltip` and the `popup_*` size shorthands ride in with the
+    # style overrides so every add_* builder accepts them without threading
+    # four more arguments through each signature, but the popup config is a
+    # top-level layer key -- left in `style` they would land somewhere the app
+    # never reads.
+    popup = normalize_popup(
+        style.pop("popup", None),
+        style.pop("tooltip", None),
+        max_width=style.pop("popup_max_width", None),
+        image_height=style.pop("popup_image_height", None),
+    )
     # Deep-copy the defaults so nested values (e.g. the vectorStyleStops list)
     # are not shared with the module constant; a caller mutating a returned
     # layer's style must not corrupt DEFAULT_LAYER_STYLE for later layers.
@@ -1171,6 +1279,50 @@ def _append_query(endpoint: str, params: list[tuple[str, str]]) -> str:
     return f"{base}{separator}{query}{sep}{fragment}"
 
 
+#: The GetMap parameters `wms_layer` writes itself, lower-cased.
+_WMS_GETMAP_KEYS = frozenset(
+    {
+        "service",
+        "request",
+        "version",
+        "layers",
+        "styles",
+        "format",
+        "transparent",
+        "srs",
+        "crs",
+        "bbox",
+        "width",
+        "height",
+    }
+)
+
+
+def _drop_query_keys(endpoint: str, keys: frozenset[str]) -> str:
+    """Remove query parameters named in ``keys`` (case-insensitive) from a URL.
+
+    The other parameters are kept byte for byte, in order, so a vendor option
+    such as ``map=...`` reaches the server exactly as the caller wrote it.
+
+    Args:
+        endpoint: A URL that may carry a query string.
+        keys: Lower-case parameter names to drop.
+
+    Returns:
+        The endpoint without those parameters.
+    """
+    base, sep, fragment = endpoint.partition("#")
+    path, qmark, query = base.partition("?")
+    if not qmark:
+        return endpoint
+    # Names are compared decoded, as a server or `URLSearchParams` reads them,
+    # so `%73RS=` counts as `SRS=`; kept parameters stay as written.
+    kept = [
+        part for part in query.split("&") if unquote_plus(part.split("=", 1)[0]).lower() not in keys
+    ]
+    return f"{path}?{'&'.join(kept)}{sep}{fragment}"
+
+
 def _resolve_bounds(bounds: list[float] | None) -> list[float] | None:
     """Validate optional layer bounds and coerce them to floats.
 
@@ -1230,6 +1382,47 @@ def _normalize_wms_version(version: str | None) -> str:
     return "1.3.0" if version.strip().startswith("1.3") else "1.1.1"
 
 
+#: Web Mercator and the geographic CRSs a WMS layer can be requested in.
+#: MapLibre tiles are Web Mercator; the geographic ones are for servers without
+#: EPSG:3857, which the desktop app requests per tile in that CRS and redraws
+#: into Web Mercator strip by strip. Keep in step with `GEOGRAPHIC_WMS_CRS` in
+#: `apps/geolibre-desktop/src/lib/wms-geographic.ts`: a geographic CRS accepted
+#: here but missing there takes the projected path, and
+#: `tests/wms-geographic.test.ts` fails when the two drift. Any other
+#: ``EPSG:<code>`` is accepted too, projected or geographic, and warped by the
+#: desktop app (see `_normalize_wms_crs`).
+WMS_CRS = frozenset({"EPSG:3857", "EPSG:4326", "EPSG:4258", "EPSG:6706", "CRS:84"})
+
+_EPSG_CODE = re.compile(r"EPSG:\d{4,6}")
+
+
+def _normalize_wms_crs(crs: str | None) -> str:
+    """Normalize the CRS a WMS layer requests its tiles in.
+
+    Args:
+        crs: The requested CRS code, or None for Web Mercator.
+
+    Returns:
+        The upper-cased code, ``"EPSG:3857"`` for None.
+
+    Raises:
+        ValueError: If ``crs`` is neither one of :data:`WMS_CRS` nor an
+            ``EPSG:<code>``.
+    """
+    if crs is None:
+        return "EPSG:3857"
+    code = str(crs).strip().upper()
+    # Any other EPSG CRS (UTM, a national grid, another geographic datum) is
+    # resolved by the desktop app from its EPSG tables; a code it does not know
+    # is sent to the server as is.
+    if code not in WMS_CRS and not _EPSG_CODE.fullmatch(code):
+        raise ValueError(
+            f"crs must be one of {sorted(WMS_CRS)} or an EPSG code such as 'EPSG:25832', "
+            f"got {crs!r}"
+        )
+    return code
+
+
 def wms_layer(
     name: str,
     endpoint: str,
@@ -1240,6 +1433,7 @@ def wms_layer(
     transparent: bool = True,
     tile_size: int = 256,
     version: str | None = "1.1.1",
+    crs: str | None = None,
     bounds: list[float] | None = None,
     **style: Any,
 ) -> dict[str, Any]:
@@ -1261,6 +1455,14 @@ def wms_layer(
             Version 1.3.0 sends ``CRS`` instead of ``SRS``; some servers accept
             only one version. EPSG:3857 keeps its axis order in both, so the
             BBOX template is unchanged. None falls back to ``"1.1.1"``.
+        crs: The CRS tiles are requested in: ``"EPSG:3857"`` (None, the
+            default) or, for a server that does not offer Web Mercator, a CRS
+            it does list in its capabilities: a geographic one
+            (``"EPSG:4326"``, ``"EPSG:4258"``, ``"EPSG:6706"``, ``"CRS:84"``)
+            or a projected ``"EPSG:<code>"`` such as ``"EPSG:25832"``. The
+            desktop app requests each tile's extent in that CRS and redraws
+            or warps it into Web Mercator; the web build still sends the Web
+            Mercator BBOX, which such a server rejects.
         bounds: Optional ``[west, south, east, north]`` request bounds, in
             WGS84. Take them from the service's ``EX_GeographicBoundingBox``,
             which is always lon/lat, rather than a 1.3.0 ``BoundingBox
@@ -1271,11 +1473,22 @@ def wms_layer(
         A layer dict for the project's ``layers`` array.
 
     Raises:
-        ValueError: If ``bounds`` is not four finite numbers with valid latitudes.
+        ValueError: If ``bounds`` is not four finite numbers with valid latitudes,
+            ``crs`` is neither one of :data:`WMS_CRS` nor an ``EPSG:<code>``,
+            or ``crs`` is ``"CRS:84"`` with a version other than 1.3.0.
     """
     wms_version = _normalize_wms_version(version)
+    wms_crs = _normalize_wms_crs(crs)
+    if wms_crs == "CRS:84" and wms_version != "1.3.0":
+        # CRS:84 is defined by WMS 1.3.0; a 1.1.1 server rejects it as an SRS.
+        raise ValueError("crs='CRS:84' needs version='1.3.0'; use EPSG:4326 with WMS 1.1.1")
+    # An endpoint copied from a capabilities OnlineResource or a GetMap URL
+    # may already carry VERSION, CRS or BBOX. A duplicate would leave the
+    # server and the desktop tile protocol (which reads the first VERSION to
+    # pick the axis order) disagreeing, so every key written here replaces
+    # the endpoint's own; vendor parameters such as `map=` are kept.
     tile_url = _append_query(
-        endpoint,
+        _drop_query_keys(endpoint, _WMS_GETMAP_KEYS),
         [
             ("SERVICE", "WMS"),
             ("REQUEST", "GetMap"),
@@ -1284,7 +1497,7 @@ def wms_layer(
             ("STYLES", styles),
             ("FORMAT", image_format),
             ("TRANSPARENT", "TRUE" if transparent else "FALSE"),
-            ("CRS" if wms_version == "1.3.0" else "SRS", "EPSG:3857"),
+            ("CRS" if wms_version == "1.3.0" else "SRS", wms_crs),
             ("BBOX", "{bbox-epsg-3857}"),
             ("WIDTH", str(tile_size)),
             ("HEIGHT", str(tile_size)),
@@ -1633,6 +1846,247 @@ def three_d_tiles_layer(
     return layer
 
 
+LIDAR_SOURCE_KIND = "lidar-url"
+"""``metadata.sourceKind`` of a LiDAR point cloud the app streams from a URL."""
+
+
+def lidar_layer(name: str, url: str, **style: Any) -> dict[str, Any]:
+    """Build a LiDAR point cloud layer from a LAS, LAZ, COPC or EPT URL.
+
+    The layer matches what the app's LiDAR control writes, so a saved project
+    re-streams the point cloud when it opens (COPC and EPT by level of detail,
+    LAS/LAZ as a whole download).
+
+    Args:
+        name: Layer display name.
+        url: HTTP(S) URL of a ``.las``, ``.laz``, ``.copc.laz`` file or an EPT
+            ``ept.json``.
+        **style: Style overrides merged into the default layer style.
+
+    Returns:
+        A layer dict for the project's ``layers`` array.
+
+    Raises:
+        ValueError: If ``url`` is not an HTTP(S) URL.
+    """
+    if not isinstance(url, str) or not url.lower().startswith(("http://", "https://")):
+        raise ValueError("url must be an http(s) URL of a LAS/LAZ/COPC file or an EPT ept.json")
+    layer = _layer_base(name, "lidar", **style)
+    source_id = layer["id"]
+    layer["source"] = {"type": "lidar", "url": url, "sourceId": source_id}
+    layer["metadata"] = {
+        "sourceKind": LIDAR_SOURCE_KIND,
+        "externalNativeLayer": True,
+        "customLayerType": "lidar",
+        "identifiable": False,
+        "sourceId": source_id,
+    }
+    layer["sourcePath"] = url
+    return layer
+
+
+POINT_CLOUD_ANNOTATION_PLUGIN_ID = "geolibre-point-cloud-annotation"
+"""Plugin id under which the app saves point cloud labels and 3D boxes."""
+
+
+MAX_POINT_LABEL_NODE_BYTES = 16 * 1024 * 1024
+"""Largest inflated size of one node's saved labels (mirrors the app's cap)."""
+
+MAX_POINT_LABEL_BYTES = 256 * 1024 * 1024
+"""Largest total inflated size of all saved labels in one project."""
+
+MAX_POINT_LABEL_EDITS = 20_000_000
+"""Most decoded label entries across a project; bounds Python memory, since a
+dict entry costs far more than the two inflated bytes behind it."""
+
+
+def decode_point_label_node(text: str, limit: int = MAX_POINT_LABEL_NODE_BYTES) -> dict[int, int]:
+    """Decode one node's saved point labels.
+
+    The app stores a node's edits as raw-DEFLATE compressed pairs of
+    (delta-varint point index, class byte), base64 encoded.
+
+    Args:
+        text: The base64 string from the project.
+        limit: Maximum inflated size in bytes; a larger record is rejected
+            without being inflated in full (a crafted decompression bomb).
+
+    Returns:
+        Point index within the node -> ASPRS class code.
+
+    Raises:
+        ValueError: If the record is truncated, not valid DEFLATE, or
+            inflates past ``limit``.
+    """
+    return _decode_point_label_node_sized(text, limit)[0]
+
+
+def _decode_point_label_node_sized(text: str, limit: int) -> tuple[dict[int, int], int]:
+    """Decode one node's saved point labels and report its inflated size.
+
+    Args:
+        text: The base64 string from the project.
+        limit: Maximum inflated size in bytes.
+
+    Returns:
+        The edits (as :func:`decode_point_label_node`) and the number of bytes
+        inflated to produce them.
+
+    Raises:
+        ValueError: As :func:`decode_point_label_node`.
+    """
+    try:
+        inflater = zlib.decompressobj(-15)
+        data = inflater.decompress(base64.b64decode(text), limit + 1)
+    except (ValueError, zlib.error) as error:
+        raise ValueError(f"invalid point label record: {error}") from error
+    if len(data) > limit or inflater.unconsumed_tail:
+        raise ValueError("point label record is too large")
+    edits: dict[int, int] = {}
+    previous = -1
+    at = 0
+    while at < len(data):
+        delta = 0
+        shift = 0
+        while True:
+            if at >= len(data):
+                raise ValueError("truncated point label record")
+            byte = data[at]
+            at += 1
+            delta += (byte & 0x7F) << shift
+            shift += 7
+            if not byte & 0x80:
+                break
+            # A point index needs at most five varint bytes; a longer run is
+            # malformed (and would make this bigint loop quadratic).
+            if shift >= 35:
+                raise ValueError("invalid point label record: varint too long")
+        if at >= len(data):
+            raise ValueError("truncated point label record")
+        index = previous + 1 + delta
+        previous = index
+        edits[index] = data[at]
+        at += 1
+    return edits, len(data)
+
+
+def point_cloud_annotations(project: dict[str, Any]) -> dict[str, Any]:
+    """Read the point labels and 3D boxes the annotator saved in a project.
+
+    Labels are keyed by each point's stable identity: the source node key (a
+    COPC/EPT octree key such as ``"2-1-0-1"``, or ``"file"`` for a LAS/LAZ
+    loaded whole) and the point's index within that node.
+
+    Args:
+        project: A project dict (e.g. ``Map.project`` or a loaded file).
+
+    Returns:
+        ``{"labels": {url: {node_key: {index: class}}}, "boxes": [...]}``, where
+        each box is ``{"url", "id", "class_code", "center", "size", "yaw"}``:
+        ``center`` is ``[lng, lat, elevation_m]``, ``size`` ``[length, width,
+        height]`` in metres and ``yaw`` radians counter-clockwise from east.
+    """
+    plugins = project.get("plugins") if isinstance(project, dict) else None
+    settings = plugins.get("settings") if isinstance(plugins, dict) else None
+    state = settings.get(POINT_CLOUD_ANNOTATION_PLUGIN_ID) if isinstance(settings, dict) else None
+    if not isinstance(state, dict):
+        state = {}
+    labels: dict[str, dict[str, dict[int, int]]] = {}
+    budget = MAX_POINT_LABEL_BYTES
+    entries = MAX_POINT_LABEL_EDITS
+    sources = state.get("sources") if isinstance(state, dict) else None
+    for source in sources if isinstance(sources, list) else []:
+        if not isinstance(source, dict):
+            continue
+        url = source.get("url")
+        nodes = source.get("nodes") or {}
+        if not isinstance(url, str) or not isinstance(nodes, dict):
+            continue
+        decoded: dict[str, dict[int, int]] = {}
+        for key, text in nodes.items():
+            if not isinstance(text, str) or budget <= 0 or entries <= 0:
+                continue
+            cap = min(MAX_POINT_LABEL_NODE_BYTES, budget)
+            try:
+                edits, inflated = _decode_point_label_node_sized(text, cap)
+            except ValueError:
+                # A rejected node may have inflated up to its cap before
+                # failing, so charge the cap: bad nodes cannot bypass the budget.
+                budget -= cap
+                continue
+            # Charge what was actually inflated (varints run to five bytes).
+            budget -= inflated
+            if len(edits) > entries:
+                continue
+            entries -= len(edits)
+            decoded[key] = edits
+        # Merge repeated entries for one URL rather than dropping the first.
+        labels.setdefault(url, {}).update(decoded)
+    boxes: list[dict[str, Any]] = []
+    cuboids = state.get("cuboids") if isinstance(state, dict) else None
+    for entry in cuboids if isinstance(cuboids, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        url = entry.get("url")
+        if not isinstance(url, str):
+            continue
+        entry_boxes = entry.get("boxes")
+        for box in entry_boxes if isinstance(entry_boxes, list) else []:
+            if not isinstance(box, dict):
+                continue
+            boxes.append(
+                {
+                    "url": url,
+                    "id": box.get("id"),
+                    "class_code": box.get("classCode"),
+                    "center": box.get("center"),
+                    "size": box.get("size"),
+                    "yaw": box.get("yaw"),
+                }
+            )
+    return {"labels": labels, "boxes": boxes}
+
+
+def apply_point_labels(classification: Any, nodes: dict[str, dict[int, int]]) -> int:
+    """Apply saved labels to the classification of a LAS/LAZ loaded whole.
+
+    Labels on a whole-file source are keyed ``"file"`` with the point's index
+    in file order, so they map straight onto e.g. ``laspy``'s
+    ``las.classification``. COPC/EPT labels are keyed by octree node and need
+    the node's point order; export those from the app as LAS/LAZ instead.
+
+    Args:
+        classification: A mutable sequence or NumPy array of class codes in
+            file order (modified in place).
+        nodes: One source's labels, as returned in
+            ``point_cloud_annotations(project)["labels"][url]``.
+
+    Returns:
+        The number of points whose class changed.
+
+    Raises:
+        ValueError: If the labels are keyed by COPC/EPT node, or an index is
+            past the end of ``classification``.
+    """
+    # Validate everything first, so a rejected record changes nothing.
+    for key, edits in nodes.items():
+        if key != "file":
+            raise ValueError(
+                f"labels keyed by octree node {key!r} need the COPC node order; "
+                "export the annotated cloud as LAS/LAZ from the app instead"
+            )
+        for index in edits:
+            if index < 0 or index >= len(classification):
+                raise ValueError(f"label index {index} is past the {len(classification)} points")
+    changed = 0
+    for edits in nodes.values():
+        for index, code in edits.items():
+            if int(classification[index]) != code:
+                classification[index] = code
+                changed += 1
+    return changed
+
+
 CESIUM_ION_SOURCE_KIND = "cesium-ion"
 """``metadata.sourceKind`` of a layer that references a Cesium Ion asset."""
 
@@ -1923,11 +2377,11 @@ def load_featurecollection(data: Any) -> dict[str, Any]:
 # The split-map (swipe), legend, and colorbar helpers are thin wrappers over the
 # app's built-in map-control plugins, configured through the project's `plugins`
 # block. The shapes here mirror the plugin project-state interfaces in
-# packages/plugins/src/plugins/* (maplibre-swipe.ts, maplibre-components.ts), so
-# the app replays them via PluginManager.restoreProjectState on load.
+# packages/plugins/src/plugins/* (maplibre-swipe.ts, components/gui-state.ts),
+# so the app replays them via PluginManager.restoreProjectState on load.
 
 # The four corners every map control accepts (CONTROL_POSITIONS in
-# maplibre-components.ts; PROJECT_PLUGIN_CONTROL_POSITIONS in core).
+# components/gui-state.ts; PROJECT_PLUGIN_CONTROL_POSITIONS in core).
 CONTROL_POSITIONS = frozenset({"top-left", "top-right", "bottom-left", "bottom-right"})
 
 # Plugin ids registered in apps/geolibre-desktop/src/hooks/usePlugins.ts.
@@ -1961,6 +2415,9 @@ PUBLISHABLE_PLUGIN_SETTINGS: dict[str, tuple[str, ...] | None] = {
     # silently start counting each new toggle as a credential. The retained
     # value is still recursively credential-scrubbed by the caller.
     "gods-eye-view": None,
+    # Point class edits keyed by (node key, index): compressed numbers, no user
+    # text. Source URLs are values, so the caller's scrub still covers them.
+    "geolibre-point-cloud-annotation": None,
 }
 
 # Plugins the app activates by default (``activeByDefault: true`` in

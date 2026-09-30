@@ -2,6 +2,8 @@
 
 The **Layers panel** on the left lists every layer in the project, from the topmost drawing layer down to the basemap. Selecting a layer here drives the [Style panel](styling.md) and the [Attribute table](attribute-table.md).
 
+The on-map **Layer Control** also lists project layers, including ones currently hidden or still loading. Its checkboxes mirror the same visibility settings as the left panel.
+
 ![The Layers panel: a group, two vector layers with the selected one's action buttons expanded, and the basemap at the bottom](https://assets.geolibre.app/images/geolibre-layers-panel.webp)
 
 ## Layer order and visibility
@@ -9,6 +11,10 @@ The **Layers panel** on the left lists every layer in the project, from the topm
 - **Visibility**: click the eye button to show or hide a layer. The **Hide all layers** button at the top of the panel hides every layer at once.
 - **Order**: drag a layer to reorder it, or use the move up and move down actions. Layers higher in the list draw on top. The basemap (**Background**) always stays at the bottom.
 - **Opacity**: each layer has an opacity slider from 0 to 100 percent.
+
+## Hover tooltips
+
+When at least one layer shows a [hover tooltip](styling.md#popups-and-hover-tooltips), the Layers panel (and the read-only viewer) shows a **Hover tooltips** checkbox. Untick it to pause every layer's hover tip while you explore the map or inspect attributes; tick it again to bring them back with the same per-layer choices and fields. This is a viewing switch only: it does not change or dirty the saved project, and it turns back on when a project opens.
 
 ## Blend modes
 
@@ -143,6 +149,7 @@ Groups are folders in the layer stack. They can nest, so a project can carry a r
 - **Create**: **New group** adds an empty folder. **New group from layer** wraps the layer you are on, and **New group from selected layers** wraps a multi-selection.
 - **Fill**: **Move to group** moves one layer, **Move selected layers to group** moves a whole selection in one step (keeping their relative order), and **Add data to group** opens Add Data with the new layer targeted at that group.
 - **Organize**: rename a group, collapse or expand it, move it up or down, and set a group-level opacity that applies to everything inside.
+- **Sort**: **Sort A to Z** and **Sort Z to A** order a group's contents by name, top of the list first. Numbers sort naturally (Parcel 2 before Parcel 10) and case is ignored. Subgroups are sorted among themselves and move with everything inside them, while the group's own layers stay together as one block. Undo restores the previous order.
 - **Visibility**: hiding a group hides its layers. A layer inside a hidden group is marked *Hidden because its group is not visible*, so you can tell it apart from a layer you turned off yourself.
 - **Remove**: **Ungroup (keep layers)** dissolves the folder and leaves its layers in place; **Delete group and layers** removes both.
 

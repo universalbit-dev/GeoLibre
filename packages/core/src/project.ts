@@ -56,6 +56,7 @@ import {
   type CommentAuthor,
   type CommentReply,
   type ProjectComment,
+  type ProjectInteraction,
 } from "./types";
 import { DEFAULT_LAYER_GROUP_OPACITY, normalizeGroupContiguity } from "./layer-groups";
 import { normalizeStyleLibraryEntries } from "./style-library";
@@ -183,6 +184,9 @@ function isGeoJsonValue(value: object): boolean {
  *   `""` at the root — the argument `JSON.stringify` passes to `toJSON`.
  * @param ancestors Containers currently open on the recursion stack, used to
  *   detect cycles.
+ * @param presets Objects whose serialized text is already known at the depth
+ *   they sit at, written verbatim instead of being walked again. Used by
+ *   {@link serializeProjectWithLayerCache} to splice in cached layers.
  * @returns The serialized text, or undefined for values `JSON.stringify` also
  *   drops (undefined, functions, symbols).
  */
@@ -191,7 +195,12 @@ function serializeProjectValue(
   depth: number,
   key: string,
   ancestors: Set<object>,
+  presets?: ReadonlyMap<object, string>,
 ): string | undefined {
+  if (presets !== undefined && value !== null && typeof value === "object") {
+    const preset = presets.get(value);
+    if (preset !== undefined) return preset;
+  }
   if (value !== null && typeof value === "object") {
     // Honor the toJSON hook the way JSON.stringify does, so a value that
     // replaces itself is inspected in its replaced form. It receives the same
@@ -227,13 +236,14 @@ function serializeProjectValue(
       const entries = Array.from(
         { length: value.length },
         (_unused, index) =>
-          serializeProjectValue(value[index], depth + 1, String(index), ancestors) ?? "null",
+          serializeProjectValue(value[index], depth + 1, String(index), ancestors, presets) ??
+          "null",
       );
       return `[\n${pad}${entries.join(`,\n${pad}`)}\n${closePad}]`;
     }
     const entries: string[] = [];
     for (const [entryKey, entry] of Object.entries(value)) {
-      const serialized = serializeProjectValue(entry, depth + 1, entryKey, ancestors);
+      const serialized = serializeProjectValue(entry, depth + 1, entryKey, ancestors, presets);
       // An unserializable object value is omitted, matching JSON.stringify.
       if (serialized === undefined) continue;
       entries.push(`${JSON.stringify(entryKey)}: ${serialized}`);
@@ -256,12 +266,75 @@ function serializeProjectValue(
 export function serializeProject(project: GeoLibreProject): string {
   return (
     serializeProjectValue(
-      { ...project, layers: project.layers.map(withoutLocalRasterBytes) },
+      { ...project, layers: project.layers.map(portableLayer) },
       0,
       "",
       new Set(),
     ) ?? "null"
   );
+}
+
+/**
+ * Per-layer serialized text kept across {@link serializeProjectWithLayerCache}
+ * calls, keyed by the layer record each entry was built from. A `WeakMap`, so a
+ * layer the store has replaced or removed drops its text with it.
+ */
+export type ProjectLayerSerializationCache = WeakMap<object, { index: number; text: string }>;
+
+/** Create an empty {@link ProjectLayerSerializationCache}. */
+export function createProjectLayerSerializationCache(): ProjectLayerSerializationCache {
+  return new WeakMap();
+}
+
+/**
+ * Serialize a project exactly as {@link serializeProject} does, reusing the
+ * text of every layer whose source record is unchanged since an earlier call.
+ *
+ * Feature data lives inside layer records, so re-stringifying every layer on
+ * each autosave costs megabytes of main-thread work for a project with large
+ * GeoJSON layers — even when only the camera moved (GeoLibre#2633). The store
+ * replaces a layer object whenever it changes, so object identity is a sound
+ * cache key: a camera move reuses every layer, and an edit to one layer
+ * re-serializes only that one.
+ *
+ * `layerSources[i]` must be the record `project.layers[i]` was derived from
+ * (e.g. the store's `layers`, before `projectFromStore` prepared them), and that
+ * derivation must depend on the record alone — as `buildProjectSnapshot`'s does
+ * — or a cached entry could outlive a change it should have reflected. When the
+ * two arrays differ in length the cache is bypassed rather than trusted.
+ *
+ * @param project Project to serialize, as built from `layerSources`.
+ * @param layerSources Immutable source record for each entry of
+ *   `project.layers`, in the same order, used as the cache key.
+ * @param cache Cache shared between calls; see
+ *   {@link createProjectLayerSerializationCache}.
+ * @returns The same text {@link serializeProject} returns for `project`.
+ */
+export function serializeProjectWithLayerCache(
+  project: GeoLibreProject,
+  layerSources: readonly object[],
+  cache: ProjectLayerSerializationCache,
+): string {
+  if (layerSources.length !== project.layers.length) return serializeProject(project);
+  const layers = project.layers.map(portableLayer);
+  // Presets are keyed by layer object, so a record listed twice would get one
+  // index's text in both places. The store never does that; bypass if it does.
+  if (new Set(layers).size !== layers.length) return serializeProject(project);
+  const presets = new Map<object, string>();
+  layers.forEach((layer, index) => {
+    const source = layerSources[index];
+    const cached = cache.get(source);
+    // The layer is serialized under its array index as the key (a `toJSON`
+    // hook would see it), so text is reused only at the index it was built for.
+    let text = cached?.index === index ? cached.text : undefined;
+    if (text === undefined) {
+      // Depth 2: the root object is depth 0 and its `layers` array depth 1.
+      text = serializeProjectValue(layer, 2, String(index), new Set()) ?? "null";
+      cache.set(source, { index, text });
+    }
+    presets.set(layer, text);
+  });
+  return serializeProjectValue({ ...project, layers }, 0, "", new Set(), presets) ?? "null";
 }
 
 export function parseProject(json: string): GeoLibreProject {
@@ -298,6 +371,7 @@ export function parseProject(json: string): GeoLibreProject {
   );
   const styleLibrary = normalizeStyleLibraryEntries(data.styleLibrary);
   const parsedComments = normalizeProjectComments(data.comments);
+  const parsedInteraction = normalizeProjectInteraction(data.interaction);
   return {
     version: data.version,
     name: data.name,
@@ -339,6 +413,7 @@ export function parseProject(json: string): GeoLibreProject {
       : {}),
     ...(styleLibrary.length > 0 ? { styleLibrary } : {}),
     ...(parsedComments.length > 0 ? { comments: parsedComments } : {}),
+    ...(parsedInteraction ? { interaction: parsedInteraction } : {}),
     metadata: data.metadata ?? {},
   };
 }
@@ -1191,6 +1266,41 @@ export function normalizeDashboardColumns(value: unknown): number {
   return Math.max(MIN_DASHBOARD_COLUMNS, Math.min(MAX_DASHBOARD_COLUMNS, Math.trunc(value)));
 }
 
+/**
+ * Coerce an untrusted `interaction` block into a {@link ProjectInteraction}.
+ *
+ * Layer ids are kept even when no such layer exists: the block is replayed
+ * against whatever layers the project has when it opens, and the loader drops
+ * the ones it cannot find. Control names are kept as written for the same
+ * reason; the app ignores names it does not know.
+ *
+ * @param value - Raw `interaction` value from the project JSON or the store.
+ * @returns The normalized block, or null when it carries nothing to apply.
+ */
+export function normalizeProjectInteraction(value: unknown): ProjectInteraction | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value as { identify?: unknown; controls?: unknown };
+  const result: ProjectInteraction = {};
+  if (raw.identify === null) {
+    result.identify = null;
+  } else if (typeof raw.identify === "string" && raw.identify) {
+    result.identify = raw.identify;
+  } else if (Array.isArray(raw.identify)) {
+    const ids = [
+      ...new Set(raw.identify.filter((id): id is string => typeof id === "string" && !!id)),
+    ];
+    if (ids.length > 0) result.identify = ids;
+  }
+  if (raw.controls && typeof raw.controls === "object" && !Array.isArray(raw.controls)) {
+    const controls: Record<string, boolean> = {};
+    for (const [name, shown] of Object.entries(raw.controls)) {
+      if (name && typeof shown === "boolean") controls[name] = shown;
+    }
+    if (Object.keys(controls).length > 0) result.controls = controls;
+  }
+  return "identify" in result || result.controls ? result : null;
+}
+
 function normalizeProjectPreferences(preferences: unknown): ProjectPreferences {
   if (!preferences || typeof preferences !== "object") {
     return DEFAULT_PROJECT_PREFERENCES;
@@ -1471,6 +1581,35 @@ function withoutLocalRasterBytes(layer: GeoLibreLayer): GeoLibreLayer {
   return { ...layer, metadata };
 }
 
+/**
+ * Drop a Zarr layer's request headers. They authenticate the store (a bearer
+ * token, an API key), so they are credentials: the Zarr adds keep them in a
+ * session-only map the renderer reads (`registerZarrHeaders` in
+ * @geolibre/map), but a project saved before that change carries them on
+ * `source` (opengeos/GeoLibre#2643). Not applied on parse, so such a project
+ * still authenticates for the session it is opened in.
+ *
+ * @param layer - Any layer.
+ * @returns The layer without `source.headers` when it is a Zarr layer, else
+ *   the same object.
+ */
+function withoutZarrHeaders(layer: GeoLibreLayer): GeoLibreLayer {
+  if (layer.type !== "zarr" || layer.source?.headers === undefined) return layer;
+  const { headers: _headers, ...source } = layer.source;
+  return { ...layer, source };
+}
+
+/**
+ * Strip the session-only state every serializer must leave out, whether or not
+ * the project came through `projectFromStore`.
+ *
+ * @param layer - Any layer.
+ * @returns The layer as it may be written to a project file.
+ */
+function portableLayer(layer: GeoLibreLayer): GeoLibreLayer {
+  return withoutZarrHeaders(withoutLocalRasterBytes(layer));
+}
+
 function normalizeLayer(layer: GeoLibreLayer): GeoLibreLayer {
   layer = withoutLocalRasterBytes(layer);
   // `capabilities` is split off the spread rather than overwritten: a raw value
@@ -1617,6 +1756,8 @@ export function projectFromStore(state: {
   /** Project-scoped Style Manager entries (the store's `projectStyleLibrary`). */
   styleLibrary?: StyleLibraryEntry[] | null;
   comments?: ProjectComment[] | null;
+  /** Startup interaction state loaded with the project, written back as-is. */
+  interaction?: ProjectInteraction | null;
   metadata: Record<string, unknown>;
 }): GeoLibreProject {
   const styles: Record<string, LayerStyle> = {};
@@ -1633,6 +1774,7 @@ export function projectFromStore(state: {
   const processingHistory = normalizeProcessingHistory(state.processingHistory);
   const widgets = normalizeWidgets(state.widgets);
   const comments = normalizeProjectComments(state.comments);
+  const interaction = normalizeProjectInteraction(state.interaction);
   // Persist a non-default column count only; a default-layout dashboard (or a
   // widget-less project) stays free of the key for legacy readers.
   const dashboardColumns =
@@ -1698,6 +1840,7 @@ export function projectFromStore(state: {
       : {}),
     ...(styleLibrary.length > 0 ? { styleLibrary } : {}),
     ...(comments.length > 0 ? { comments } : {}),
+    ...(interaction ? { interaction } : {}),
     metadata: state.metadata,
   };
 }
@@ -1718,7 +1861,7 @@ function hasRestorableSourceUrl(layer: GeoLibreLayer): boolean {
 }
 
 function prepareLayerForSave(layer: GeoLibreLayer): GeoLibreLayer {
-  layer = withoutLocalRasterBytes(layer);
+  layer = portableLayer(layer);
   // This flag describes unsaved changes to the live source, not persisted
   // project state. A reference-only save reloads the original geometries;
   // carrying the flag into that project would warn about nonexistent edits.
@@ -1781,6 +1924,20 @@ function prepareLayerForSave(layer: GeoLibreLayer): GeoLibreLayer {
     layer = rest;
   }
 
+  // An Add Vector Layer layer GeoLibre adopted (`maplibre-gl-vector-adopted`,
+  // ADOPTED_VECTOR_SOURCE_KIND in @geolibre/plugins) holds its features in
+  // `geojson`, but a URL-backed one saves the URL and is re-read through the
+  // control on reopen, like the control layer it was. A browser-picked file has
+  // no URL and keeps its features, like a drag-and-drop layer.
+  if (
+    layer.geojson &&
+    layer.metadata.sourceKind === "maplibre-gl-vector-adopted" &&
+    hasRestorableSourceUrl(layer)
+  ) {
+    const { geojson: _geojson, ...rest } = layer;
+    layer = rest;
+  }
+
   // A local-file layer the desktop host can re-read from its absolute path on
   // reopen (a drag-dropped or Add Data vector file) does not embed its features
   // either: the path is saved and the data is reloaded from disk. The flag is
@@ -1834,7 +1991,16 @@ function prepareLayerForSave(layer: GeoLibreLayer): GeoLibreLayer {
   };
 }
 
-function portableWmsTileUrl(tile: unknown): unknown {
+/**
+ * The plain HTTP(S) WMS template inside the desktop app's `geolibre-wms://`
+ * wrapper (its CORS-exempt native fetcher), or the tile unchanged when it is
+ * not wrapped or the wrapped URL is not HTTP(S). Shared by project export and
+ * the ArcGIS engine's story-export templates.
+ *
+ * @param tile - A tile template, wrapped or not.
+ * @returns The unwrapped template, or `tile` itself.
+ */
+export function portableWmsTileUrl(tile: unknown): unknown {
   // Keep this protocol prefix in sync with WMS_TILE_PROTOCOL in the desktop
   // app, which packages/core cannot import without reversing dependencies.
   if (typeof tile !== "string" || !tile.startsWith("geolibre-wms://")) return tile;
@@ -1872,6 +2038,7 @@ export function applyProjectToStore(project: GeoLibreProject): {
   primaryRenderer: MapRendererKind;
   projectStyleLibrary: StyleLibraryEntry[];
   comments: ProjectComment[];
+  projectInteraction: ProjectInteraction | null;
   metadata: Record<string, unknown>;
 } {
   // Legacy and externally-authored projects can carry a partial top-level
@@ -1978,6 +2145,7 @@ export function applyProjectToStore(project: GeoLibreProject): {
     primaryRenderer: normalizePrimaryRenderer(project.primaryRenderer) ?? DEFAULT_PRIMARY_RENDERER,
     projectStyleLibrary: normalizeStyleLibraryEntries(project.styleLibrary),
     comments: scrubbedComments,
+    projectInteraction: normalizeProjectInteraction(project.interaction),
     metadata: project.metadata,
   };
 }

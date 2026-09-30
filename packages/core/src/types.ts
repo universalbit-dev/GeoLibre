@@ -977,6 +977,21 @@ export interface LayerPopupConfig {
   /** `false` drops the synthetic `id` row. Defaults to `true`. */
   showFeatureId?: boolean;
   /**
+   * Widest the click popup may grow, in CSS pixels. Unset keeps the default
+   * (520px, or 420px for a popup carrying an image). Clamped to the range
+   * `resolvePopupMaxWidth` enforces and always capped by the viewport, so a
+   * value wider than the window still leaves the map usable.
+   */
+  maxWidth?: number;
+  /**
+   * Tallest an `"image"` field's thumbnail may draw inside the popup, in CSS
+   * pixels. Unset keeps the default (`min(50vh, 420px)`). Clamped by
+   * `resolvePopupImageHeight`. Pair it with {@link maxWidth} for a
+   * bigger picture: the thumbnail keeps its aspect ratio, so widening the
+   * popup is what lets a landscape photo use the extra height.
+   */
+  imageHeight?: number;
+  /**
    * The fields to show and their order. An empty or absent list keeps today's
    * behavior: every visible property, in the feature's own key order.
    */
@@ -1304,7 +1319,9 @@ export interface AddTileLayerOptions {
   tiles: string[];
   /**
    * Layer discriminator, controlling how the layer is labelled and (for WMS)
-   * dev-server proxied. Defaults to `"xyz"`.
+   * dev-server proxied. Defaults to `"xyz"`. The layer's `source.type` is
+   * always `"raster"`, so any other value (such as `"vector-tiles"` from an
+   * untyped JS caller) throws rather than persisting a mislabelled source.
    */
   type?: "xyz" | "wms" | "wmts" | "raster";
   /** Service or base URL recorded on the source for display and restore. */
@@ -2347,7 +2364,32 @@ export interface GeoLibreProject {
   styleLibrary?: StyleLibraryEntry[];
   /** Anchored review comments on map points or features (issue #1518). */
   comments?: ProjectComment[];
+  /**
+   * Interaction state applied when the project opens: the Identify target and
+   * which map controls and toolbar panels start shown (issue #2688). Written by
+   * the Python `geolibre` package from `set_identify` / `show_control`, so a
+   * saved or HTML-exported notebook map opens the way it was set up. Omitted
+   * by default; the app keeps what it loaded and writes it back unchanged.
+   */
+  interaction?: ProjectInteraction;
   metadata: Record<string, unknown>;
+}
+
+/**
+ * Startup interaction state carried by a project (see
+ * {@link GeoLibreProject.interaction}).
+ */
+export interface ProjectInteraction {
+  /**
+   * Identify target on open: a layer id, `"all"` for every visible queryable
+   * layer, a list of layer ids to identify only those, or `null` for off.
+   */
+  identify?: string | string[] | null;
+  /**
+   * Map control or toolbar panel name (`"search"`, `"bookmark"`, `"globe"`,
+   * ...) to whether it starts shown. Unknown names are ignored on open.
+   */
+  controls?: Record<string, boolean>;
 }
 
 export type CommentAnchor =

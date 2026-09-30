@@ -1238,6 +1238,38 @@ describe("PluginManager plugin coordination", () => {
     assert.equal(manager.applyPluginState("missing", app, {}), false);
   });
 
+  it("clears project-data state on a load that does not carry it, when opted in", () => {
+    const manager = new PluginManager();
+    const data: unknown[] = [];
+    const preference: unknown[] = [];
+    manager.register(
+      testPlugin({
+        id: "data",
+        clearsStateOnProjectLoad: true,
+        applyProjectState: (_app, state) => {
+          data.push(state);
+        },
+      }),
+    );
+    manager.register(
+      testPlugin({
+        id: "preference",
+        applyProjectState: (_app, state) => {
+          preference.push(state);
+        },
+      }),
+    );
+    const empty = { manifestUrls: [], activePluginIds: [], mapControlPositions: {}, settings: {} };
+    manager.restoreProjectState(
+      { ...empty, settings: { data: { labels: 1 }, preference: { on: true } } },
+      app,
+    );
+    // A second project with neither setting: only the opted-in plugin is reset.
+    manager.restoreProjectState(empty, app);
+    assert.deepEqual(data, [{ labels: 1 }, undefined]);
+    assert.deepEqual(preference, [{ on: true }]);
+  });
+
   it("prevents recursive activation across coordinating plugins", async () => {
     const manager = new PluginManager();
     let firstCalls = 0;
@@ -1457,6 +1489,106 @@ describe("PluginManager renderer compatibility", () => {
     scoped!.registerRightPanel?.({ id: "stale-panel", title: "Stale", render: () => undefined });
     assert.equal(registered, 1);
   });
+  it("lets an inactive plugin mount restored panels after an async import", async () => {
+    // The Components legend/colorbar/HTML panels restore from saved settings
+    // without activating the plugin, and mount only once a dynamic import
+    // resolves, so the restore scope must outlive the synchronous turn.
+    const manager = new PluginManager();
+    let scoped: GeoLibreAppAPI | undefined;
+    let mounted = 0;
+    manager.register(
+      testPlugin({
+        restoresPanelCollapseState: true,
+        applyProjectState: (value) => {
+          scoped = value;
+        },
+      }),
+    );
+    const api = {
+      getMapRenderer: () => "maplibre",
+      addMapControl: () => {
+        mounted++;
+        return true;
+      },
+    } as unknown as GeoLibreAppAPI;
+    const state = {
+      manifestUrls: [],
+      activePluginIds: [],
+      mapControlPositions: {},
+      settings: { "url-loader": { legend: {} } },
+    };
+    manager.restoreProjectState(state, api);
+    await Promise.resolve();
+    await Promise.resolve();
+    const control = { onAdd: () => null as never, onRemove: () => {} };
+    assert.equal(scoped!.addMapControl(control), true);
+    assert.equal(mounted, 1);
+  });
+  it("rejects restored panels after a renderer handoff or re-registration", async () => {
+    const manager = new PluginManager();
+    const scopes: GeoLibreAppAPI[] = [];
+    let renderer: "maplibre" | "cesium" = "maplibre";
+    manager.register(
+      testPlugin({
+        engines: ["maplibre", "cesium"],
+        applyProjectState: (value) => {
+          scopes.push(value);
+        },
+      }),
+    );
+    const api = {
+      getMapRenderer: () => renderer,
+      addMapControl: () => true,
+    } as unknown as GeoLibreAppAPI;
+    const state = {
+      manifestUrls: [],
+      activePluginIds: [],
+      mapControlPositions: {},
+      settings: { "url-loader": { legend: {} } },
+    };
+    const control = { onAdd: () => null as never, onRemove: () => {} };
+    manager.restoreProjectState(state, api);
+    await Promise.resolve();
+    renderer = "cesium";
+    assert.equal(scopes[0].addMapControl(control), false);
+    renderer = "maplibre";
+    manager.restoreProjectState(state, api);
+    await Promise.resolve();
+    manager.register(testPlugin({ engines: ["maplibre", "cesium"] }));
+    assert.equal(scopes[1].addMapControl(control), false);
+  });
+  it("rejects restored panels once a later restore supersedes the scope", async () => {
+    const manager = new PluginManager();
+    const scopes: GeoLibreAppAPI[] = [];
+    let mounted = 0;
+    manager.register(
+      testPlugin({
+        applyProjectState: (value) => {
+          scopes.push(value);
+        },
+      }),
+    );
+    const api = {
+      getMapRenderer: () => "maplibre",
+      addMapControl: () => {
+        mounted++;
+        return true;
+      },
+    } as unknown as GeoLibreAppAPI;
+    const state = {
+      manifestUrls: [],
+      activePluginIds: [],
+      mapControlPositions: {},
+      settings: { "url-loader": { legend: {} } },
+    };
+    manager.restoreProjectState(state, api);
+    manager.restoreProjectState(state, api);
+    await Promise.resolve();
+    const control = { onAdd: () => null as never, onRemove: () => {} };
+    assert.equal(scopes[0].addMapControl(control), false);
+    assert.equal(scopes[1].addMapControl(control), true);
+    assert.equal(mounted, 1);
+  });
   it("rejects controls from an activation replaced by a renderer switch", () => {
     const manager = new PluginManager();
     let renderer: "maplibre" | "cesium" = "maplibre";
@@ -1490,5 +1622,86 @@ describe("PluginManager renderer compatibility", () => {
     assert.equal(scopes[0].addMapControl(control), false);
     assert.equal(scopes[1].addMapControl(control), true);
     assert.equal(mounted, 1);
+  });
+});
+
+describe("PluginManager getProjectState fallback", () => {
+  const restored = {
+    manifestUrls: [],
+    activePluginIds: [],
+    mapControlPositions: { broken: "top-left" as const },
+    settings: { broken: { step: 1 } },
+  };
+  const brokenPlugin = () =>
+    testPlugin({
+      id: "broken",
+      getProjectState: () => {
+        throw new Error("control is gone");
+      },
+    });
+
+  it("keeps a failing plugin's restored entry by default", () => {
+    const manager = new PluginManager();
+    manager.register(brokenPlugin());
+    manager.restoreProjectState(restored, app);
+
+    const state = manager.getProjectState();
+    assert.deepEqual(state.settings.broken, { step: 1 });
+    assert.equal(state.mapControlPositions.broken, "top-left");
+  });
+
+  it("takes a failing plugin's entry from a newer stored snapshot when given one", () => {
+    const manager = new PluginManager();
+    manager.register(brokenPlugin());
+    manager.restoreProjectState(restored, app);
+
+    const state = manager.getProjectState({
+      ...restored,
+      mapControlPositions: { broken: "bottom-right" },
+      settings: { broken: { step: 7 } },
+    });
+    assert.deepEqual(state.settings.broken, { step: 7 });
+    assert.equal(state.mapControlPositions.broken, "bottom-right");
+  });
+
+  it("keeps a live control position read before the state accessor threw", () => {
+    const manager = new PluginManager();
+    manager.register({ ...brokenPlugin(), getMapControlPosition: () => "top-right" });
+    manager.restoreProjectState(restored, app);
+
+    const state = manager.getProjectState();
+    assert.equal(state.mapControlPositions.broken, "top-right");
+    assert.deepEqual(state.settings.broken, { step: 1 });
+  });
+});
+
+describe("PluginManager restore onto a replaced map", () => {
+  it("reactivates active plugins when the map was replaced on the same renderer", () => {
+    const manager = new PluginManager();
+    const calls: string[] = [];
+    manager.register(
+      testPlugin({
+        id: "dock",
+        activate: () => {
+          calls.push("activate");
+        },
+        deactivate: () => {
+          calls.push("deactivate");
+        },
+      }),
+    );
+    const state = {
+      manifestUrls: [],
+      activePluginIds: ["dock"],
+      mapControlPositions: {},
+      settings: {},
+    };
+    manager.restoreProjectState(state, app);
+    manager.restoreProjectState(state, app);
+    assert.deepEqual(calls, ["activate"]);
+
+    manager.restoreProjectState(state, app, { mapReplaced: true });
+    assert.deepEqual(calls, ["activate", "deactivate", "activate"]);
+    assert.equal(manager.isActive("dock"), true);
   });
 });

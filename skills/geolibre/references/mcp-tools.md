@@ -20,6 +20,7 @@ Pick by what the data **is**:
 | An XYZ raster tile template (`{z}/{x}/{y}.png`) | `add_tile_layer` | Basemaps like OSM go here, not `set_basemap`. |
 | A PMTiles archive, or a vector tile service | `add_tiles_layer` | `kind="pmtiles"` (with `tile_type`) or `kind="vector-tiles"`. |
 | A WMS or WMTS endpoint | `add_ogc_layer` | `service="wms"` or `"wmts"`. |
+| A LAS/LAZ/COPC/EPT point cloud | `add_lidar_layer` | COPC and EPT stream by level of detail; the app's Point Cloud Annotation plugin can label it. |
 | An OGC 3D Tiles tileset | `add_3d_tiles_layer` | `altitude_offset` to sit it on the ground; `ion_asset_id` instead of `url` for a Cesium Ion tileset. |
 | A Cesium Ion asset (tileset or imagery) | `add_cesium_ion_layer` | 3D globe only: pair it with `set_renderer` / `primaryRenderer: "cesium"`. `kind="imagery"` for imagery. |
 | A CZML (Cesium Language) dynamic scene: orbits, tracks, moving models | `add_czml_layer` | 3D globe only: `url` for a `.czml` document, or `data` for its packet array inline. The globe follows the document's `clock`. |
@@ -37,6 +38,7 @@ position); omitted, the layer goes on top.
 create_project(path, name="Untitled Project", center=None, zoom=None,
                basemap=None, overwrite=False)
 describe_project(path)
+get_point_cloud_annotations(path)
 list_catalog()
 ```
 
@@ -45,6 +47,9 @@ project even with `overwrite=True`, so a retry cannot destroy an unrelated
 `package.json` sitting in a root.
 
 `describe_project` reports inlined feature data as a count, never echoed back.
+
+`get_point_cloud_annotations` reports, per point cloud URL, how many points the
+app's annotator relabelled into each ASPRS class, plus every saved 3D box.
 
 `list_catalog` returns the basemaps, color ramp names, legend presets, and the
 active workspace roots. Call it before guessing any of those names.
@@ -60,9 +65,10 @@ add_raster_layer(path, name, url, bands=None, colormap=None, rescale=None,
 add_tile_layer(path, name, url, tile_size=256, attribution=None, index=None)
 add_ogc_layer(path, name, service, endpoint, layers=None, styles="",
               image_format="image/png", transparent=True, tile_size=256,
-              version="1.1.1", bounds=None, index=None)
+              version="1.1.1", crs=None, bounds=None, index=None)
 add_tiles_layer(path, name, url, kind="pmtiles", tile_type="vector",
                 source_layers=None, style=None, index=None)
+add_lidar_layer(path, name, url, index=None)
 add_3d_tiles_layer(path, name, url=None, ion_asset_id=None, altitude_offset=0, index=None)
 add_cesium_ion_layer(path, name, asset_id, kind="3d-tiles", altitude_offset=0, index=None)
 add_czml_layer(path, name, url=None, data=None, index=None)
@@ -87,7 +93,15 @@ add_cesium_kml_layer(path, name, url=None, data=None, index=None)
   `ows:WGS84BoundingBox` for WMTS, which is where the WMS element is absent.
   Both are already lon/lat, unlike a WMS 1.3.0 `BoundingBox CRS="EPSG:4326"`,
   whose axis order servers often get wrong. Passing anything other than four
-  values is an error rather than a silently dropped extent.
+  values is an error rather than a silently dropped extent. `crs` is the CRS
+  WMS tiles are requested in, `EPSG:3857` when omitted: check that the layer
+  lists it in the capabilities, because a server without Web Mercator answers
+  every tile with an XML exception and the layer stays blank. For such a
+  server pass a CRS it does list, preferably a geographic one (`EPSG:4326`,
+  `EPSG:4258`, `EPSG:6706`, or `CRS:84` with `version="1.3.0"`), otherwise a
+  projected `EPSG:<code>` such as `EPSG:25832`: the desktop app redraws or
+  warps those tiles into Web Mercator, while the web build and `export_html`
+  pages cannot show them.
 
 ### Editing
 
@@ -97,7 +111,8 @@ remove_layer(path, layer)
 style_layer(path, layer, style)
 set_layer_popup(path, layer, fields=None, click=None, title=None,
                 title_expression=None, body_expression=None,
-                show_feature_id=None, tooltip=None, merge=False)
+                show_feature_id=None, max_width=None, image_height=None,
+                tooltip=None, merge=False)
 classify_layer(path, layer, column, class_count=5, colormap="viridis",
                scheme="equal-interval")
 list_layer_properties(path, layer)
@@ -118,9 +133,12 @@ entry is a property name or an object with `field` plus any of `label`, `kind`,
 `link_label`. `kind` is `auto`, `text`, `number`, `date`, `link` (an http(s) URL
 becomes an anchor) or `image` (an http(s) URL or inline base64 raster data URL
 becomes a thumbnail). `tooltip` takes the property names to put in the hover
-tip; `[]` turns the tip off. `merge=True` edits the existing config in place, so
-a tooltip can be added without restating the fields. Run
-`list_layer_properties` first to get the real column names.
+tip; `[]` turns the tip off. `max_width` (288–1200) is how wide the click popup
+may draw and `image_height` (40–1200) how tall an `image` field's thumbnail may
+draw inside it, both in CSS pixels; a thumbnail keeps its aspect ratio, so raise
+`max_width` too for a landscape photo to use the extra height. `merge=True`
+edits the existing config in place, so a tooltip can be added without restating
+the fields. Run `list_layer_properties` first to get the real column names.
 
 `classify_layer` clamps `class_count` to 2–12. `scheme` is `equal-interval`
 (even value ranges) or `quantile` (even feature counts per class). It needs an
@@ -134,6 +152,8 @@ set_renderer(path, renderer, pane_id=None)
 set_map_layout(path, rows, cols, view_kinds=None, sync_view=True)
 set_view(path, center=None, zoom=None, bearing=None, pitch=None, bbox=None)
 set_basemap(path, basemap)
+set_map_legend(path, title=None, position=None, group_by_layer=None,
+               visible=None, collapsed=None)
 add_legend(path, title=None, legend_dict=None, labels=None, colors=None,
            builtin=None, position="bottom-left", shape="square")
 add_colorbar(path, colormap="viridis", vmin=0.0, vmax=1.0, label="", units="",
@@ -149,7 +169,11 @@ add_swipe(path, left_layers, right_layers, orientation="vertical",
 - `set_basemap` takes a named basemap or a MapLibre style JSON URL. An XYZ
   raster basemap (OpenStreetMap, Esri imagery) is **not** a basemap style — add
   it with `add_tile_layer` at `index=0`.
-- `add_legend`: give it exactly one of `legend_dict` (`{label: color}`),
+- `set_map_legend`: the app's own legend panel (Controls > Legend). Its rows
+  come from each visible layer's symbology, so after `classify_layer` it lists
+  the classes with no entries to write. Prefer it to `add_legend` for a styled
+  layer; a project has one, and calling it again updates it.
+- `add_legend`: hand-written entries. Give it exactly one of `legend_dict` (`{label: color}`),
   `labels` + `colors` (paired lists), or `builtin` (a preset name such as `nlcd`
   or `esa_worldcover`).
 - `add_colorbar`: `vmin` must be less than `vmax`. `colors` overrides `colormap`

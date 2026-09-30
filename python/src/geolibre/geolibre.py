@@ -45,6 +45,18 @@ _STATIC_APP = _HERE / "static" / "app"
 _VALID_LAYOUTS = frozenset({"embed", "full", "maponly"})
 _VALID_THEMES = frozenset({"light", "dark"})
 
+#: Toolbar panels :meth:`Map.show_control` opens. Mirrors ``SCRIPTABLE_PANELS``
+#: in ``apps/geolibre-desktop/src/lib/scripting/ui-controls.ts``.
+MAP_PANELS = frozenset({"bookmark", "search", "measure", "minimap", "print"})
+
+#: Built-in map controls :meth:`Map.show_control` shows or hides. Mirrors
+#: ``SCRIPTABLE_MAP_CONTROLS`` in the same module.
+MAP_CONTROLS = frozenset(
+    {"navigation", "fullscreen", "compass", "geolocate", "globe", "scale", "attribution", "logo"}
+)
+
+_VALID_PROJECTIONS = frozenset({"globe", "mercator"})
+
 # CSV/tabular input is inlined into the project exactly like GeoJSON is, so the
 # same 50 MB ceiling applies to a fetched response or a local file.
 _MAX_TABULAR_BYTES = _project._MAX_GEOJSON_BYTES
@@ -344,6 +356,12 @@ class Map(anywidget.AnyWidget):
     _seq = traitlets.Int(0).tag(sync=True)
     # Last error reported by the app (e.g. an invalid project).
     error = traitlets.Unicode("").tag(sync=True)
+    # UI state replayed into the app whenever it loads: ``identify`` (a layer
+    # id, a list of layer ids, "all", or None) and ``controls`` (a control or
+    # panel name -> shown). Set through set_identify/show_control. The live
+    # project does not carry it; exports write it as the project's
+    # ``interaction`` block (see _project_with_ui).
+    _ui = traitlets.Dict().tag(sync=True)
 
     def __init__(
         self,
@@ -1029,7 +1047,7 @@ class Map(anywidget.AnyWidget):
             URLs or tile sources for a fully self-contained export.
         """
         html = render_project_html(
-            self.project,
+            self._project_with_ui(copy.deepcopy(self.project)),
             title=title,
             width=width,
             height=height or self.height,
@@ -1111,6 +1129,8 @@ class Map(anywidget.AnyWidget):
         title_expression: str | None = None,
         body_expression: str | None = None,
         show_feature_id: bool | None = None,
+        max_width: int | None = None,
+        image_height: int | None = None,
         tooltip: Any = None,
         merge: bool = False,
     ) -> dict[str, Any]:
@@ -1132,6 +1152,12 @@ class Map(anywidget.AnyWidget):
             title_expression: MapLibre expression source producing the title.
             body_expression: MapLibre expression source producing the body text.
             show_feature_id: ``False`` drops the synthetic ``id`` row.
+            max_width: Widest the click popup may draw, in CSS pixels (288 to
+                1200). The viewport still caps it.
+            image_height: Tallest an ``"image"`` field's thumbnail may draw
+                inside the popup, in CSS pixels (40 to 1200). A thumbnail keeps
+                its aspect ratio, so raise ``max_width`` too for a landscape
+                photo to use the extra height.
             tooltip: Hover shorthand -- a property name, a sequence of names,
                 ``True`` to flag every configured field, or ``False`` to turn
                 the tooltip off. The tooltip and the click popup share one
@@ -1155,6 +1181,8 @@ class Map(anywidget.AnyWidget):
             ...     ],
             ...     title="name",
             ...     tooltip="name",
+            ...     max_width=480,
+            ...     image_height=320,
             ... )
         """
         handle = self._resolve_layer(layer)
@@ -1171,6 +1199,8 @@ class Map(anywidget.AnyWidget):
                 title_expression=title_expression,
                 body_expression=body_expression,
                 show_feature_id=show_feature_id,
+                max_width=max_width,
+                image_height=image_height,
                 tooltip=tooltip,
                 merge=merge,
             )
@@ -1483,15 +1513,16 @@ class Map(anywidget.AnyWidget):
     ) -> str:
         """Add a single point marker at ``[lng, lat]``.
 
-        The marker is a GeoJSON point layer; its ``properties`` are shown when
-        the point is clicked. See :meth:`add_markers` for the symbology and
+        The marker is a GeoJSON point layer; its ``properties`` are shown in a
+        popup when the point is clicked while Identify is armed (see
+        :meth:`set_identify`). See :meth:`add_markers` for the symbology and
         popup arguments, which behave identically here.
 
         Args:
             lng: Marker longitude.
             lat: Marker latitude.
             name: Layer display name.
-            properties: Optional feature properties (shown on click).
+            properties: Optional feature properties (shown in the Identify popup).
             color: Marker color.
             opacity: Fill opacity in ``[0, 1]``.
             radius: Circle radius in pixels.
@@ -1500,8 +1531,9 @@ class Map(anywidget.AnyWidget):
             shape: Marker shape; switches to sprite rendering.
             size: Sprite size in pixels; switches to sprite rendering.
             icon: SVG markup or data URL for a custom sprite.
-            **style: Further style overrides, plus ``popup=``/``tooltip=``
-                (see :meth:`add_markers`).
+            **style: Further style overrides, plus ``popup=``/``tooltip=`` and
+                the ``popup_max_width=``/``popup_image_height=`` size
+                shorthands (see :meth:`add_markers`).
 
         Returns:
             The id of the added layer.
@@ -1569,7 +1601,9 @@ class Map(anywidget.AnyWidget):
             **style: Further style overrides, plus ``popup=`` and ``tooltip=``
                 to configure what a click and a hover show. ``popup`` takes a
                 property name, a list of names or field mappings, or a config
-                mapping; see :meth:`set_popup`.
+                mapping; see :meth:`set_popup`. ``popup_max_width=`` and
+                ``popup_image_height=`` size the popup and its pictures, in CSS
+                pixels, without spelling out the rest of a config mapping.
 
         Returns:
             The id of the added layer.
@@ -1582,6 +1616,8 @@ class Map(anywidget.AnyWidget):
             ...     size=32,
             ...     popup=["name", {"field": "photo", "kind": "image"}],
             ...     tooltip="name",
+            ...     popup_max_width=480,
+            ...     popup_image_height=320,
             ... )
         """
         # setdefault, not update: a raw style key passed alongside the named
@@ -2331,6 +2367,7 @@ class Map(anywidget.AnyWidget):
         transparent: bool = True,
         tile_size: int = 256,
         version: str | None = "1.1.1",
+        crs: str | None = None,
         bounds: list[float] | None = None,
         **style: Any,
     ) -> str:
@@ -2347,6 +2384,12 @@ class Map(anywidget.AnyWidget):
             version: WMS protocol version, ``"1.1.1"`` (default) or
                 ``"1.3.0"``. Version 1.3.0 sends ``CRS`` instead of ``SRS``;
                 some servers accept only one version.
+            crs: The CRS tiles are requested in, ``"EPSG:3857"`` when None.
+                For a server without Web Mercator, a CRS it lists: a
+                geographic one (``"EPSG:4326"``, ``"EPSG:4258"``,
+                ``"EPSG:6706"``, ``"CRS:84"``) or a projected
+                ``"EPSG:<code>"`` such as ``"EPSG:25832"``. The desktop app
+                redraws those tiles into Web Mercator.
             bounds: Optional ``[west, south, east, north]`` request bounds, in
                 WGS84. A WMS layer has no geometry to derive an extent from,
                 so without these "zoom to layer" cannot reach it.
@@ -2356,7 +2399,8 @@ class Map(anywidget.AnyWidget):
             The id of the added layer.
 
         Raises:
-            ValueError: If ``bounds`` is not four finite numbers with valid latitudes.
+            ValueError: If ``bounds`` is not four finite numbers with valid
+                latitudes, or ``crs`` is not a supported CRS.
         """
         return self._add_layer(
             _project.wms_layer(
@@ -2368,6 +2412,7 @@ class Map(anywidget.AnyWidget):
                 transparent=transparent,
                 tile_size=tile_size,
                 version=version,
+                crs=crs,
                 bounds=bounds,
                 **style,
             )
@@ -2670,6 +2715,37 @@ class Map(anywidget.AnyWidget):
             )
         )
 
+    def add_lidar(self, url: str, name: str | None = None, **style: Any) -> str:
+        """Add a LiDAR point cloud from a LAS, LAZ, COPC or EPT URL.
+
+        COPC and EPT stream by level of detail; LAS/LAZ download whole. Open the
+        app's **Plugins → Point Cloud Annotation** to label its points.
+
+        Args:
+            url: HTTP(S) URL of a ``.las``, ``.laz``, ``.copc.laz`` file or an
+                EPT ``ept.json``.
+            name: Layer display name (defaults to the file name).
+            **style: Style overrides.
+
+        Returns:
+            The id of the added layer.
+        """
+        if name is None and isinstance(url, str):
+            tail = url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+            name = tail or "LiDAR"
+        return self._add_layer(_project.lidar_layer(name, url, **style))
+
+    def point_cloud_annotations(self) -> dict[str, Any]:
+        """The point labels and 3D boxes saved by the app's point cloud annotator.
+
+        Returns:
+            ``{"labels": {url: {node_key: {index: class}}}, "boxes": [...]}``;
+            see :func:`geolibre.project.point_cloud_annotations`. Apply the
+            labels of a whole-file LAS/LAZ source to ``laspy`` data with
+            :func:`geolibre.project.apply_point_labels`.
+        """
+        return _project.point_cloud_annotations(self.project)
+
     def add_cesium_ion(
         self,
         asset_id: int,
@@ -2786,10 +2862,16 @@ class Map(anywidget.AnyWidget):
         """
 
         resolved_id = self._resolve_layer(layer_id).id
+        # Disarm before the project sync, not after: the two traits sync
+        # independently, so clearing second leaves a window where the front end
+        # replays `identify` for a layer the project push just deleted.
+        self._drop_identify_layers(lambda layer_id: layer_id == resolved_id)
         self._update_project(lambda p: _authoring.remove_layer(p, resolved_id))
 
     def clear_layers(self) -> None:
         """Remove all layers from the map."""
+        # Disarm first, for the reason given in `remove_layer`.
+        self._drop_identify_layers(lambda _layer_id: True)
         self._update_project(lambda p: p.update({"layers": []}))
 
     # -- view / basemap API ---------------------------------------------
@@ -2912,6 +2994,175 @@ class Map(anywidget.AnyWidget):
         if not isinstance(value, str) or not value.strip():
             raise ValueError("name must be a non-empty string")
         self._update_project(lambda p: p.update(name=value.strip()))
+
+    # -- interaction: identify, controls, projection ---------------------
+
+    def _set_ui(self, **changes: Any) -> None:
+        """Merge ``changes`` into the synced ``_ui`` trait.
+
+        Like :meth:`_update_project`, this reassigns a new dict, because
+        traitlets only syncs a changed value, not an in-place edit.
+
+        Args:
+            **changes: ``identify`` and/or ``controls`` entries to replace.
+        """
+        self._ui = {**self._ui, **changes}
+
+    def _drop_identify_layers(self, removed: Callable[[str], bool]) -> None:
+        """Drop removed layers from the Identify target in ``_ui``.
+
+        A list that keeps one layer narrows to that layer, and one that keeps
+        none turns Identify off, matching what the app does when those layers
+        are deleted there. ``"all"`` and ``None`` are left alone.
+
+        Args:
+            removed: Returns ``True`` for the id of a layer being removed.
+        """
+        identify = self._ui.get("identify")
+        if identify is None or identify == "all":
+            return
+        if isinstance(identify, str):
+            if removed(identify):
+                self._set_ui(identify=None)
+            return
+        kept = [layer_id for layer_id in identify if not removed(layer_id)]
+        if len(kept) == len(identify):
+            return
+        self._set_ui(identify=kept[0] if len(kept) == 1 else (kept or None))
+
+    def _project_with_ui(self, project: dict[str, Any]) -> dict[str, Any]:
+        """Write the Identify and control state into ``project`` for export.
+
+        :meth:`set_identify` and :meth:`show_control` keep their state out of
+        the live project so a project push never reopens a panel the user
+        closed. A saved or exported project has no kernel to replay it, so it
+        carries the state as its ``interaction`` block, which the app applies
+        when the project opens.
+
+        Args:
+            project: A detached project dict, modified in place.
+
+        Returns:
+            ``project``, for chaining.
+        """
+        interaction: dict[str, Any] = {}
+        identify = self._ui.get("identify")
+        if identify is not None:
+            interaction["identify"] = list(identify) if isinstance(identify, list) else identify
+        controls = self._ui.get("controls")
+        if controls:
+            interaction["controls"] = dict(controls)
+        if interaction:
+            project["interaction"] = interaction
+        return project
+
+    def set_identify(self, layer: str | Layer | Sequence[str | Layer] | None = "all") -> None:
+        """Arm the Identify tool so clicking a feature opens its popup.
+
+        Popups (including those configured with :meth:`set_popup` or the
+        ``popup=`` argument of :meth:`add_markers`) open only while Identify is
+        armed. This does from Python what the Identify button on a layer, or
+        the "Identify visible layers" button in the Layers panel header, does
+        in the app. The choice is applied when the map loads, so it can be
+        made before the map is displayed.
+
+        Identify is armed on one layer, on a list of layers, or on every
+        visible layer, and hover tooltips pause while it is armed, as they do
+        in the app. The choice is saved by :meth:`save_project`,
+        :meth:`to_project` and :meth:`to_html`, so a shared map opens with
+        Identify armed the same way.
+
+        Args:
+            layer: A layer id, display name, or :class:`Layer` handle to
+                identify on that layer; a list of them to identify only those
+                layers (clicking opens popups for them and not for the rest);
+                ``"all"`` (the default) to identify every visible queryable
+                layer; or ``None`` to turn Identify off. ``"all"`` is matched
+                before the lookup, so a layer whose id or display name is
+                literally ``"all"`` cannot be targeted on its own.
+
+        Raises:
+            ValueError: If ``layer`` (or any entry of a list) matches no layer,
+                or a list is empty.
+        """
+        if layer is None or (isinstance(layer, str) and layer == "all"):
+            self._set_ui(identify=layer)
+            return
+        if isinstance(layer, (str, Layer)):
+            self._set_ui(identify=self._resolve_layer(layer).id)
+            return
+        if not isinstance(layer, Sequence):
+            raise ValueError(
+                "set_identify: layer must be a layer id, name, handle, a list of them, "
+                f'"all", or None, got {type(layer).__name__}'
+            )
+        ids = list(dict.fromkeys(self._resolve_layer(item).id for item in layer))
+        if not ids:
+            raise ValueError("set_identify: the list of layers is empty")
+        self._set_ui(identify=ids[0] if len(ids) == 1 else ids)
+
+    def show_control(self, name: str, visible: bool = True) -> None:
+        """Show (or hide) a map control or toolbar panel.
+
+        Covers the panels in the app's Controls menu (``"bookmark"``,
+        ``"search"``, ``"measure"``, ``"minimap"``, ``"print"``) and the
+        built-in map controls (``"navigation"``, ``"fullscreen"``,
+        ``"compass"``, ``"geolocate"``, ``"globe"``, ``"scale"``,
+        ``"attribution"``, ``"logo"``). The choice is applied when the map
+        loads, so it can be made before the map is displayed. It is saved by
+        :meth:`save_project`, :meth:`to_project` and :meth:`to_html`, so a
+        shared map opens with the same controls.
+
+        Hiding ``"globe"`` removes the globe/flat toggle button only; use
+        :meth:`set_projection` to change how the map is drawn.
+
+        Args:
+            name: The control or panel name.
+            visible: ``True`` to show it, ``False`` to hide it.
+
+        Raises:
+            ValueError: If ``name`` is not a known control or panel.
+        """
+        if name not in MAP_PANELS and name not in MAP_CONTROLS:
+            raise ValueError(
+                f"Unknown control {name!r}; expected one of {sorted(MAP_PANELS | MAP_CONTROLS)}"
+            )
+        self._set_ui(controls={**self._ui.get("controls", {}), name: bool(visible)})
+
+    def hide_control(self, name: str) -> None:
+        """Hide a map control or toolbar panel (see :meth:`show_control`).
+
+        Args:
+            name: The control or panel name.
+        """
+        self.show_control(name, False)
+
+    def set_projection(self, projection: str) -> None:
+        """Draw the map as a 3D globe or as a flat Web Mercator map.
+
+        New maps use ``"globe"``, which shows the Earth as a sphere at low
+        zooms. The projection is saved in the project.
+
+        Args:
+            projection: ``"globe"`` or ``"mercator"``.
+
+        Raises:
+            ValueError: If ``projection`` is not one of the two.
+        """
+        if projection not in _VALID_PROJECTIONS:
+            raise ValueError(f"projection must be 'globe' or 'mercator', got {projection!r}")
+
+        def _apply(p: dict[str, Any]) -> None:
+            preferences = p.setdefault("preferences", {})
+            preferences.setdefault("map", {})["projection"] = projection
+
+        self._update_project(_apply)
+
+    @property
+    def projection(self) -> str:
+        """The persisted map projection, ``"globe"`` or ``"mercator"``."""
+        projection = self.project.get("preferences", {}).get("map", {}).get("projection")
+        return "mercator" if projection == "mercator" else "globe"
 
     # -- map controls: split map / legend / colorbar --------------------
 
@@ -3053,6 +3304,48 @@ class Map(anywidget.AnyWidget):
             )
         )
 
+    def set_map_legend(
+        self,
+        title: str | None = None,
+        *,
+        position: str | None = None,
+        group_by_layer: bool | None = None,
+        visible: bool | None = None,
+        collapsed: bool | None = None,
+    ) -> None:
+        """Show the map legend, the panel behind the app's Controls -> Legend.
+
+        Its rows come from each visible layer's symbology, so a classified or
+        categorized layer gets a matching legend without restating its colors
+        (use :meth:`add_legend` for hand-written entries). A map has one;
+        calling this again updates it.
+
+        Args:
+            title: Heading drawn above the entries; keeps the current one when
+                omitted.
+            position: ``"top-left"``, ``"top-right"``, ``"bottom-left"``, or
+                ``"bottom-right"``; keeps the current corner when omitted.
+            group_by_layer: Group each layer's classes under a layer heading;
+                keeps the current setting when omitted.
+            visible: Whether the on-map panel is open; keeps the current state
+                when omitted, and opens it when the map has no legend yet.
+            collapsed: Whether the open panel is collapsed to its header bar;
+                keeps the current state when omitted.
+
+        Raises:
+            ValueError: If ``position`` is not a map corner.
+        """
+        self._update_project(
+            lambda p: _authoring.set_map_legend(
+                p,
+                title,
+                position=position,
+                group_by_layer=group_by_layer,
+                visible=visible,
+                collapsed=collapsed,
+            )
+        )
+
     def add_colorbar(
         self,
         *,
@@ -3134,10 +3427,14 @@ class Map(anywidget.AnyWidget):
         Credentials are removed by default so a returned project is safe to
         serialize or commit. Pass ``keep_credentials=True`` only for a trusted
         local workflow that must preserve authenticated layer configuration.
+
+        The Identify target and control visibility set with
+        :meth:`set_identify` and :meth:`show_control` are included as the
+        project's ``interaction`` block.
         """
         if keep_credentials:
-            return copy.deepcopy(self.project)
-        return _project.redact_credentials(self.project)
+            return self._project_with_ui(copy.deepcopy(self.project))
+        return self._project_with_ui(_project.redact_credentials(self.project))
 
     def load_project(self, source: Any) -> None:
         """Replace the current project.
@@ -3196,11 +3493,65 @@ class Map(anywidget.AnyWidget):
             project["layers"] = []
         elif not isinstance(layers, list):
             raise ValueError("Invalid project: 'layers' must be a list")
+        layer_ids = {layer.get("id") for layer in project["layers"] if isinstance(layer, dict)}
+        # A saved project carries its Identify target and controls as an
+        # `interaction` block. Move it into `_ui`, which is what the widget
+        # replays, so the live project never carries a second copy that a
+        # project push would re-apply.
+        interaction = project.pop("interaction", None)
+        # A pinned Identify target belongs to the project being replaced, so
+        # drop it unless the incoming project still has that layer. Leaving it
+        # would replay `setIdentify` for a missing layer on the next sync, which
+        # the front end rejects into a reply nobody reads -- Identify would end
+        # up disarmed anyway, just via a stray error. "all" and None survive any
+        # project, as in `clear_layers`.
+        self._drop_identify_layers(lambda layer_id: layer_id not in layer_ids)
         self._seq += 1
         self.project = project
+        if isinstance(interaction, dict):
+            self._apply_interaction(interaction, layer_ids)
+
+    def _apply_interaction(self, interaction: dict[str, Any], layer_ids: set[Any]) -> None:
+        """Load a saved project's ``interaction`` block into ``_ui``.
+
+        Entries the app would ignore are skipped rather than raised on: the
+        block may come from a hand-edited file or a newer app version.
+
+        Args:
+            interaction: The project's ``interaction`` block.
+            layer_ids: Ids of the layers in the loaded project.
+        """
+        changes: dict[str, Any] = {}
+        if "identify" in interaction:
+            identify = interaction["identify"]
+            if identify is None or identify == "all":
+                changes["identify"] = identify
+            else:
+                raw = [identify] if isinstance(identify, str) else identify
+                ids = (
+                    list(dict.fromkeys(i for i in raw if i in layer_ids))
+                    if isinstance(raw, list)
+                    else []
+                )
+                changes["identify"] = ids[0] if len(ids) == 1 else (ids or None)
+        controls = interaction.get("controls")
+        if isinstance(controls, dict):
+            changes["controls"] = {
+                **self._ui.get("controls", {}),
+                **{
+                    name: shown
+                    for name, shown in controls.items()
+                    if (name in MAP_PANELS or name in MAP_CONTROLS) and isinstance(shown, bool)
+                },
+            }
+        if changes:
+            self._set_ui(**changes)
 
     def save_project(self, path: str, *, keep_credentials: bool = False) -> None:
         """Write the current project to a ``.geolibre.json`` file.
+
+        Like :meth:`to_project`, the file carries the Identify target and
+        control visibility as its ``interaction`` block.
 
         Args:
             path: Destination file path. Parent directories are created if
@@ -3210,11 +3561,7 @@ class Map(anywidget.AnyWidget):
         """
         out = pathlib.Path(path).expanduser()
         out.parent.mkdir(parents=True, exist_ok=True)
-        project = (
-            copy.deepcopy(self.project)
-            if keep_credentials
-            else _project.redact_credentials(self.project)
-        )
+        project = self.to_project(keep_credentials=keep_credentials)
         out.write_text(json.dumps(project, indent=2), encoding="utf-8")
 
 

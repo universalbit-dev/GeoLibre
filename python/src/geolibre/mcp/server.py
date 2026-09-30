@@ -60,6 +60,7 @@ Pick the layer tool by what the data *is*, not by file extension alone:
 - `add_tile_layer`     - a raster XYZ tile template with {z}/{x}/{y}.
 - `add_tiles_layer`    - PMTiles or a vector tile service.
 - `add_ogc_layer`      - a WMS or WMTS endpoint.
+- `add_lidar_layer`    - a LAS/LAZ/COPC/EPT point cloud by URL.
 - `add_3d_tiles_layer` - an OGC 3D Tiles tileset (URL or Cesium Ion asset id).
 - `add_cesium_ion_layer` - a Cesium Ion asset (tileset or imagery) by id, 3D globe only.
 - `add_czml_layer`     - a CZML dynamic 3D scene (orbits, vehicle tracks) by URL or
@@ -557,6 +558,7 @@ def build_server(workspace: Workspace) -> MCPServer:
         transparent: bool = True,
         tile_size: int = 256,
         version: str | None = "1.1.1",
+        crs: str | None = None,
         bounds: list[float] | None = None,
         index: int | None = None,
     ) -> dict[str, Any]:
@@ -574,6 +576,14 @@ def build_server(workspace: Workspace) -> MCPServer:
             transparent: Request a transparent background (WMS).
             tile_size: Tile edge in pixels.
             version: WMS protocol version, e.g. `1.1.1` or `1.3.0`.
+            crs: The CRS WMS tiles are requested in; `EPSG:3857` when
+                omitted. Check the capabilities first: if the layer does not
+                list EPSG:3857, pass a CRS it does list, preferably a
+                geographic one (`EPSG:4326`, `EPSG:4258`, `EPSG:6706`,
+                `CRS:84`), otherwise a projected `EPSG:<code>` such as
+                `EPSG:25832`. The desktop app redraws those tiles into Web
+                Mercator; the web build and `export_html` pages cannot show
+                them.
             bounds: The layer's extent as `[west, south, east, north]` in
                 WGS84. A service layer has no geometry to derive it from, so
                 without this "zoom to layer" cannot reach it. Read it from the
@@ -587,10 +597,15 @@ def build_server(workspace: Workspace) -> MCPServer:
 
         Raises:
             ValueError: If `service` is not `wms` or `wmts`, if `layers` is
-                missing for `wms`, or if `bounds` is not four finite numbers
-                with valid latitudes.
+                missing for `wms`, if `bounds` is not four finite numbers
+                with valid latitudes, or if `crs` is not a supported CRS or
+                is given for `wmts`.
         """
         if service == "wmts":
+            if crs is not None:
+                # A WMTS template carries its own tile matrix set; there is no
+                # GetMap request for a CRS to change.
+                raise ValueError("add_ogc_layer: 'crs' applies only to service='wms'")
             layer = _project.wmts_layer(name, endpoint, tile_size=tile_size, bounds=bounds)
         elif service == "wms":
             if not layers:
@@ -604,6 +619,7 @@ def build_server(workspace: Workspace) -> MCPServer:
                 transparent=transparent,
                 tile_size=tile_size,
                 version=version,
+                crs=crs,
                 bounds=bounds,
             )
         else:
@@ -658,6 +674,59 @@ def build_server(workspace: Workspace) -> MCPServer:
         else:
             raise ValueError(f"kind must be 'pmtiles' or 'vector-tiles', got {kind!r}")
         return add(path, layer, index)
+
+    @tool()
+    def add_lidar_layer(
+        path: str,
+        name: str,
+        url: str,
+        index: int | None = None,
+    ) -> dict[str, Any]:
+        """Add a LiDAR point cloud from a LAS, LAZ, COPC or EPT URL.
+
+        COPC and EPT stream by level of detail; LAS/LAZ download whole. The app
+        re-streams it when the project opens, and its Point Cloud Annotation
+        plugin can label its points.
+
+        Args:
+            path: Path to the `.geolibre.json` file.
+            name: Layer display name.
+            url: HTTP(S) URL of a `.las`, `.laz`, `.copc.laz` file or an EPT
+                `ept.json`.
+            index: Draw-order position; omit to add on top.
+
+        Returns:
+            A summary of the added layer.
+        """
+        return add(path, _project.lidar_layer(name, url), index)
+
+    @tool()
+    def get_point_cloud_annotations(path: str) -> dict[str, Any]:
+        """Read the point labels and 3D boxes saved by the point cloud annotator.
+
+        Args:
+            path: Path to the `.geolibre.json` file.
+
+        Returns:
+            Per source URL, how many points were relabelled per class, plus
+            every saved 3D box (`class_code`, `center` [lng, lat, elevation m],
+            `size` [length, width, height] m, `yaw` radians from east).
+        """
+        file = workspace.resolve(path, must_exist=True)
+        project = authoring.load_project(file)
+        annotations = _project.point_cloud_annotations(project)
+        # Source URLs can be signed (e.g. a presigned S3 link); report them the
+        # way the rest of the project is shared, with credentials stripped.
+        labels: dict[str, dict[str, int]] = {}
+        for url, nodes in annotations["labels"].items():
+            url = _project.redact_url(url)
+            # Two signed links to one cloud redact to the same URL: merge them.
+            counts = labels.setdefault(url, {})
+            for edits in nodes.values():
+                for code in edits.values():
+                    counts[str(code)] = counts.get(str(code), 0) + 1
+        boxes = [{**box, "url": _project.redact_url(box["url"])} for box in annotations["boxes"]]
+        return {"labels": labels, "boxes": boxes}
 
     @tool()
     def add_3d_tiles_layer(
@@ -844,6 +913,8 @@ def build_server(workspace: Workspace) -> MCPServer:
         title_expression: str | None = None,
         body_expression: str | None = None,
         show_feature_id: bool | None = None,
+        max_width: int | None = None,
+        image_height: int | None = None,
         tooltip: list[str] | None = None,
         merge: bool = False,
     ) -> dict[str, Any]:
@@ -870,6 +941,12 @@ def build_server(workspace: Workspace) -> MCPServer:
             body_expression: MapLibre expression source producing the body as
                 one block of text instead of the field rows.
             show_feature_id: False drops the synthetic `id` row.
+            max_width: Widest the click popup may draw, in CSS pixels (288 to
+                1200). The viewport still caps it.
+            image_height: Tallest an `image` field's thumbnail may draw inside
+                the popup, in CSS pixels (40 to 1200). Thumbnails keep their
+                aspect ratio, so raise `max_width` too for a landscape photo to
+                use the extra height.
             tooltip: Property names to show in a hover tooltip. An empty list
                 turns the tooltip off.
             merge: Merge into the layer's existing popup config instead of
@@ -888,6 +965,8 @@ def build_server(workspace: Workspace) -> MCPServer:
                 title_expression=title_expression,
                 body_expression=body_expression,
                 show_feature_id=show_feature_id,
+                max_width=max_width,
+                image_height=image_height,
                 tooltip=tooltip,
                 merge=merge,
             )
@@ -1078,6 +1157,49 @@ def build_server(workspace: Workspace) -> MCPServer:
                 shape=shape,
             )
         return _summarize(file, project, legend=entry)
+
+    @tool()
+    def set_map_legend(
+        path: str,
+        title: str | None = None,
+        position: str | None = None,
+        group_by_layer: bool | None = None,
+        visible: bool | None = None,
+        collapsed: bool | None = None,
+    ) -> dict[str, Any]:
+        """Show the map legend, built from the layers' own symbology.
+
+        This is the app's Controls > Legend panel: its rows come from each
+        visible layer's style (graduated classes, categories, ramps), so it
+        needs no entries. Use `add_legend` for hand-written entries instead. A
+        project has one map legend; calling this again updates it.
+
+        Args:
+            path: Path to the `.geolibre.json` file.
+            title: Heading above the entries. Keeps the current one when
+                omitted.
+            position: `top-left`, `top-right`, `bottom-left`, or
+                `bottom-right`. Keeps the current corner when omitted.
+            group_by_layer: Group each layer's classes under a layer heading.
+                Keeps the current setting when omitted.
+            visible: Whether the on-map panel is open. Keeps the current
+                state when omitted; a new legend opens.
+            collapsed: Whether the open panel is collapsed to its header.
+                Keeps the current state when omitted.
+
+        Returns:
+            The project's map legend config.
+        """
+        with edit(path) as (file, project):
+            legend = authoring.set_map_legend(
+                project,
+                title,
+                position=position,
+                group_by_layer=group_by_layer,
+                visible=visible,
+                collapsed=collapsed,
+            )
+        return _summarize(file, project, mapLegend=legend)
 
     @tool()
     def add_colorbar(

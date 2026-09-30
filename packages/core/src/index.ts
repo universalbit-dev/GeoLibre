@@ -13,6 +13,7 @@ export * from "./routing";
 export * from "./polyline";
 export * from "./vector-color";
 export * from "./expressions";
+export * from "./style-layer-evaluator";
 export * from "./document-locale";
 export * from "./label-number-format";
 export * from "./external-native-paint";
@@ -61,6 +62,10 @@ export {
   canUndoProjectRestore,
   DEFAULT_COLLABORATION_STATE,
   IDENTIFY_ALL_LAYERS_ID,
+  type IdentifyState,
+  identifyAllIncludes,
+  identifyStateWithoutLayers,
+  resolveIdentifyTarget,
   projectPathLabel,
   registerProjectRestoreHistory,
   subscribeProjectRestoreHistory,
@@ -76,6 +81,18 @@ export {
   type StatisticsToolKind,
   type VectorToolKind,
 } from "./store";
+export {
+  NO_LAYERS,
+  selectLayerById,
+  selectLayerIds,
+  selectLayerSummaries,
+  selectLayersWhen,
+  useLayer,
+  useLayerIds,
+  useLayerSummaries,
+  useLayersWhen,
+  type LayerSummary,
+} from "./layer-selectors";
 export {
   getHistoryCoalesceMs,
   setHistoryCoalesceMs,
@@ -146,6 +163,7 @@ export {
   CESIUM_ION_SOURCE_KIND,
   CESIUM_OSM_BUILDINGS_ASSET_ID,
   CESIUM_BING_AERIAL_ASSET_ID,
+  CESIUM_GOOGLE_PHOTOREALISTIC_ASSET_ID,
   cesiumIonAssetId,
   cesiumIonAssetKind,
   createCesiumIonLayer,
@@ -153,6 +171,8 @@ export {
   isCesiumOnlyLayer,
   parseCesiumIonAssetId,
   type CesiumIonAssetKind,
+  type CesiumIonQuickPick,
+  type CesiumIonQuickPickGroup,
   type CesiumIonLayerOptions,
 } from "./cesium-ion";
 export {

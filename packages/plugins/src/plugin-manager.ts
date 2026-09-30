@@ -16,6 +16,8 @@ export class PluginManager {
   private renderer: MapRendererKind | null = null;
   private deferredState: ProjectPluginState | null = null;
   private deferredActive = new Set<string>();
+  /** Bumped by every restoreProjectState so a superseded restore's scopes go stale. */
+  private restorePass = 0;
 
   private supportsEngine(id: string, app: GeoLibreAppAPI): boolean {
     return isPluginEngineSupported(this.plugins.get(id), app.getMapRenderer?.() ?? "maplibre");
@@ -25,10 +27,19 @@ export class PluginManager {
     app: GeoLibreAppAPI,
     id: string,
     options: ScopeAppOptions = {},
+    restorePass?: number,
   ): GeoLibreAppAPI {
     const generation = this.activationGenerations.get(id);
+    // A later renderer handoff or re-registration invalidates the scope even
+    // before the next restore bumps the pass.
+    const plugin = this.plugins.get(id);
+    const renderer = app.getMapRenderer?.() ?? "maplibre";
     // Settings and restore callbacks may register UI synchronously before
-    // activation. Retained callbacks need a live activation after this turn.
+    // activation. Retained callbacks need a live activation after this turn,
+    // except a project restore's: an inactive plugin may still mount the
+    // panels its saved state describes once a dynamic import resolves (the
+    // Components legend, colorbar, and HTML panels), until the next restore
+    // (another project load or a renderer swap) supersedes this one.
     let synchronous = true;
     queueMicrotask(() => {
       synchronous = false;
@@ -36,11 +47,14 @@ export class PluginManager {
     return scopeAppToPlugin(app, id, {
       ...options,
       canAddControl: () =>
+        this.plugins.get(id) === plugin &&
+        (app.getMapRenderer?.() ?? "maplibre") === renderer &&
         this.supportsEngine(id, app) &&
         this.activationGenerations.get(id) === generation &&
         (this.activating.has(id) ||
           this.active.has(id) ||
-          (!options.assistantTools && synchronous)),
+          (!options.assistantTools &&
+            (synchronous || (restorePass !== undefined && restorePass === this.restorePass)))),
     });
   }
 
@@ -163,21 +177,45 @@ export class PluginManager {
     return this.activationResults.get(id);
   }
 
-  getProjectState(): ProjectPluginState {
+  /**
+   * Snapshots every plugin's project state.
+   *
+   * @param fallbackState - Where a plugin that cannot report its own state
+   *   (unsupported on this renderer, or its accessor threw) takes its entry
+   *   from. Defaults to the state last restored; a caller holding a newer
+   *   stored snapshot should pass it.
+   * @returns The plugin state to persist with the project.
+   */
+  getProjectState(
+    fallbackState: ProjectPluginState | null = this.deferredState,
+  ): ProjectPluginState {
     const mapControlPositions: ProjectPluginState["mapControlPositions"] = {};
     const settings: ProjectPluginState["settings"] = {};
     for (const plugin of this.plugins.values()) {
       if (this.renderer && !isPluginEngineSupported(plugin, this.renderer)) {
-        const position = this.deferredState?.mapControlPositions[plugin.id];
+        const position = fallbackState?.mapControlPositions[plugin.id];
         if (position) mapControlPositions[plugin.id] = position;
-        if (this.deferredState?.settings && plugin.id in this.deferredState.settings)
-          settings[plugin.id] = this.deferredState.settings[plugin.id];
+        if (fallbackState?.settings && plugin.id in fallbackState.settings)
+          settings[plugin.id] = fallbackState.settings[plugin.id];
         continue;
       }
-      const position = plugin.getMapControlPosition?.();
-      if (position) mapControlPositions[plugin.id] = position;
-      const pluginState = plugin.getProjectState?.();
-      if (pluginState !== undefined) settings[plugin.id] = pluginState;
+      // One plugin that cannot report its state (an external plugin whose
+      // control is gone, say) must not cost every other plugin its snapshot.
+      try {
+        const position = plugin.getMapControlPosition?.();
+        if (position) mapControlPositions[plugin.id] = position;
+        const pluginState = plugin.getProjectState?.();
+        if (pluginState !== undefined) settings[plugin.id] = pluginState;
+      } catch (error) {
+        console.warn(`[GeoLibre] Could not read the project state of plugin "${plugin.id}"`, error);
+        // Keep a live position read before the state accessor threw.
+        if (!(plugin.id in mapControlPositions)) {
+          const position = fallbackState?.mapControlPositions[plugin.id];
+          if (position) mapControlPositions[plugin.id] = position;
+        }
+        if (fallbackState?.settings && plugin.id in fallbackState.settings)
+          settings[plugin.id] = fallbackState.settings[plugin.id];
+      }
     }
 
     return {
@@ -495,10 +533,15 @@ export class PluginManager {
   restoreProjectState(
     state: ProjectPluginState | null,
     app: GeoLibreAppAPI,
-    options: { resetMissingSettings?: boolean } = {},
+    options: { resetMissingSettings?: boolean; mapReplaced?: boolean } = {},
   ): void {
+    const restorePass = ++this.restorePass;
     const renderer = app.getMapRenderer?.() ?? "maplibre";
-    if (this.renderer !== null && renderer !== this.renderer) {
+    // A new map took down every live control with the old one, so reactivate
+    // from scratch. A swap and back (MapLibre to Mapbox to MapLibre) before
+    // the middle map restored lands on the same renderer kind, so the kind
+    // alone cannot tell; the caller says when the map itself was replaced.
+    if (this.renderer !== null && (renderer !== this.renderer || options.mapReplaced)) {
       for (const id of Array.from(this.active)) this.deactivate(id, app);
     }
     this.renderer = renderer;
@@ -551,12 +594,17 @@ export class PluginManager {
     // write the collapsed state back on the next save.
     const scopeForRestore = (id: string, assistantTools = false): GeoLibreAppAPI =>
       this.plugins.get(id)?.restoresPanelCollapseState
-        ? this.scopeAppToPlugin(app, id, { assistantTools })
-        : this.scopeAppToPlugin(app, id, {
-            assistantTools,
-            onControlAdded: collapseRestoredPanel,
-            onRightPanelOpened: collapseRestoredRightPanel,
-          });
+        ? this.scopeAppToPlugin(app, id, { assistantTools }, restorePass)
+        : this.scopeAppToPlugin(
+            app,
+            id,
+            {
+              assistantTools,
+              onControlAdded: collapseRestoredPanel,
+              onRightPanelOpened: collapseRestoredRightPanel,
+            },
+            restorePass,
+          );
 
     // Deactivate first so plugins that should be inactive tear down their live
     // controls before we touch positions or settings. This keeps the order of
@@ -588,9 +636,14 @@ export class PluginManager {
       }
 
       // Regular project loads apply only the settings present in the file. New
-      // project resets can opt into clearing cached state for every plugin.
+      // project resets can opt into clearing cached state for every plugin,
+      // and a plugin whose state is project data (not a preference) opts into
+      // being cleared by any load that does not carry it.
       const hasSetting = state?.settings && id in state.settings;
-      if (plugin.applyProjectState && (hasSetting || options.resetMissingSettings)) {
+      if (
+        plugin.applyProjectState &&
+        (hasSetting || options.resetMissingSettings || plugin.clearsStateOnProjectLoad)
+      ) {
         const updated = plugin.applyProjectState(
           scopedApp,
           hasSetting ? state.settings[id] : undefined,

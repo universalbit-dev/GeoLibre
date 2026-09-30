@@ -97,6 +97,7 @@ See [iOS](ios.md) for what runs on mobile and for build details.
 - [Mapping the 2026 Nepal Floods with Free High-Resolution Satellite Imagery](https://youtu.be/UDO1BCwOAAc)
 - [Building Cloud-Native GIS Workflows with GeoLibre](https://youtu.be/RgNoKsvZ5Hk)
 - [Image Georeferencing Using GeoLibre in the Browser](https://youtu.be/lbioujkDSG0)
+- [100 Interactive Maps from Open Data: Explore, Fork, and Build Your Own with GeoLibre](https://youtu.be/2r5OhvEa3AA)
 
 All of them, with chapters and summaries, are on [Video Tutorials](tutorials/videos.md).
 
@@ -455,6 +456,22 @@ drag-and-drop, embed commands — but does **not** restrict the server, so keep
 the protections above in place too. See
 [Deployment Capabilities](deployment-capabilities.md).
 
+#### Custom app name
+
+Replace "GeoLibre" at the start of the toolbar and in the browser tab title with
+your own name:
+
+```bash
+docker run --rm -p 8080:80 \
+  -e GEOLIBRE_APP_NAME="Acme Maps" \
+  ghcr.io/opengeos/geolibre:latest
+```
+
+The name is read at container startup, so a prebuilt image can be rebranded
+without a rebuild. Runs of whitespace collapse to one space and the name is
+capped at 60 characters. For a non-Docker web build, set
+`VITE_GEOLIBRE_APP_NAME` when running `npm run build` instead.
+
 #### Driving an embedded map from a host page
 
 To let a page that frames the app talk to the live map over `postMessage` (fly to
@@ -539,18 +556,36 @@ URLs. For a real deployment, set `GEOLIBRE_SHARE_URL`,
 `GEOLIBRE_COLLAB_URL`, `GEOLIBRE_VIEWER_URL`, and
 `GEOLIBRE_CORS_ORIGINS` to the public TLS origins before starting Compose.
 
-Behind a reverse proxy, only the web container should be reachable from outside
-the host. The Compose file publishes the projects server on `8000` and the relay
-on `8787` for local use, and pointing the browser URLs at your proxy does not
-stop anyone connecting to those listeners directly. Bind them to loopback (or
-drop the mappings entirely and let the proxy reach them over the Compose
-network) with an override file:
+The server's OAuth endpoints are disabled until `GEOLIBRE_OAUTH_CLIENTS`
+contains exact public client registrations. To enable server-side OAuth for a
+local web deployment:
+
+```bash
+export GEOLIBRE_OAUTH_CLIENTS='[{"client_id":"geolibre-web","name":"GeoLibre Web","redirect_uris":["http://localhost:8080/oauth-callback.html"],"scopes":["read:projects","write:projects","share:public"]}]'
+POSTGRES_PASSWORD=choose-a-password docker compose up --build
+```
+
+Production web callbacks require HTTPS and must end in
+`/oauth-callback.html`. The desktop client uses the exact callback
+`org.geolibre.desktop:/oauth/callback`. Add its separate
+`geolibre-desktop` registration to the same JSON array when desktop sign-in is
+required. The web app signs in through a popup to the server's consent page
+using this registration, so the `geolibre-web` callback URL must match the web
+app's own origin (including any base path). Desktop sign-in (the system
+browser flow) is still pending; desktop users paste a personal API token. See
+the [server API OAuth contract](server-api.md#oauth-20-sign-in-authorization-code-s256-pkce)
+for the flow and lifetime settings.
+
+Behind a reverse proxy, keep the projects API behind the rate-limit boundary:
+Compose binds its host port to `127.0.0.1` by default. Do not override that
+binding to `0.0.0.0` or publish the container port directly; either have a
+same-host proxy connect to loopback or let a proxy container reach the API over
+the Compose network. The relay still publishes `8787` for local use; bind it to
+loopback when only the web container should be reachable from outside the host:
 
 ```yaml
 # docker-compose.override.yml
 services:
-  geolibre-server:
-    ports: ["127.0.0.1:8000:8000"]
   geolibre-collab:
     ports: ["127.0.0.1:8787:8787"]
 ```

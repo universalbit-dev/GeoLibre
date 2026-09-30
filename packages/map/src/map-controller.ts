@@ -73,9 +73,19 @@ import {
   syncLayerBlendModes,
 } from "./layer-blend-modes";
 import { ensureGeneratedImageHandler } from "./generated-images";
+import { installSelectionDragGuard } from "./selection-drag-guard";
 import { installGlobePopupOcclusion } from "./globe-popup-occlusion";
 import { isMapboxStyleUrl, loadMapboxStyle, redactMapboxStyleUrl } from "./mapbox-style";
 import { PlanetaryScaleControl } from "./planetary-scale-control";
+import {
+  boundsFillMinZoom,
+  latFromMercatorY,
+  lngFromMercatorX,
+  mercatorBoundsForLngLatBounds,
+  mercatorXFromLng,
+  mercatorYFromLat,
+  normalizeMapBounds,
+} from "./map-bounds";
 import { getOfflineBasemapStyle, isOfflineBasemapSentinel } from "./protomaps-basemap";
 import { ResetBearingControl } from "./reset-bearing-control";
 import { MaptoolkitLogoControl } from "./maptoolkit-logo-control";
@@ -384,6 +394,8 @@ export class MapController implements MapEngine {
   readonly kind = "maplibre" as const;
   readonly capabilities: MapEngineCapabilities = MAPLIBRE_CAPABILITIES;
   private map: maplibregl.Map | null = null;
+  /** Whether {@link clampViewToPreferences} has a clamp queued on `moveend`. */
+  private pendingViewClamp = false;
   private navigationControl: maplibregl.NavigationControl | null = null;
   private fullscreenControl: maplibregl.FullscreenControl | null = null;
   private compassControl: ResetBearingControl | null = null;
@@ -523,6 +535,10 @@ export class MapController implements MapEngine {
       canvasContextAttributes: { preserveDrawingBuffer: true },
     });
     ensureGeneratedImageHandler(this.map);
+    // A leftover text selection would otherwise turn a map drag into a native
+    // drag of the selection in WebKit; see selection-drag-guard.ts.
+    this.selectionDragGuardDispose?.();
+    this.selectionDragGuardDispose = installSelectionDragGuard(this.map.getCanvasContainer());
     installGlobePopupOcclusion(maplibregl);
     // Per-layer blend modes wrap MapLibre's render loop, so they have to be in
     // place before the first frame. Feature-detected: an unsupported build
@@ -984,6 +1000,8 @@ export class MapController implements MapEngine {
     this.abortPendingMapboxStyle();
     this.removeClusterZoomListener();
     this.removePendingNativeFilterListener();
+    this.selectionDragGuardDispose?.();
+    this.selectionDragGuardDispose = null;
     this.map?.remove();
     this.map = null;
     this.styleReady = false;
@@ -1154,7 +1172,7 @@ export class MapController implements MapEngine {
     this.map.setTransformConstrain(
       createMapTransformConstraint(preferences, this.map, minZoom, maxZoom),
     );
-    this.applyView(this.readView());
+    this.clampViewToPreferences();
     // The ellipsoid or the scale unit can change here (Settings' dropdowns)
     // without the basemap changing, so push the unit and redraw the body-aware
     // scale bar now — the store's ellipsoid subscription has already updated the
@@ -1163,6 +1181,37 @@ export class MapController implements MapEngine {
     // or both).
     this.scaleControl?.setUnit(preferences.scaleUnit);
     this.scaleControl?.refresh();
+  }
+
+  /**
+   * Re-apply the current camera so the constraints {@link applyMapPreferences}
+   * just installed (min/max zoom, max pitch, max bounds) actually clamp it.
+   *
+   * `applyView` gets there by jumping, and a jump *stops* an in-flight camera
+   * animation, leaving the camera wherever that animation had reached. Map
+   * preferences do change mid-animation: loading a LiDAR point cloud flips the
+   * projection preference through the deck.gl overlays' shared mercator lock
+   * from the very `load` event the plugin fires right after starting its
+   * fly-to-the-data, so that fly-to was being cancelled before it had moved a
+   * pixel and the layer never came into view. While the camera is moving,
+   * clamp once it settles instead — the setters above already constrain the
+   * animation's own target, so nothing escapes the new limits in the meantime.
+   */
+  private clampViewToPreferences(): void {
+    if (!this.map) return;
+    if (!this.isCameraMoving()) {
+      this.applyView(this.readView());
+      return;
+    }
+    // One deferred clamp is enough however many preference changes land during
+    // the same movement, and it must not re-arm on the `moveend` its own jump
+    // fires.
+    if (this.pendingViewClamp) return;
+    this.pendingViewClamp = true;
+    this.map.once("moveend", () => {
+      this.pendingViewClamp = false;
+      this.applyView(this.readView());
+    });
   }
 
   readView(): MapViewState {
@@ -1598,6 +1647,7 @@ export class MapController implements MapEngine {
   private searchDisposers = new Set<() => void>();
 
   private extentDrawingDispose: (() => void) | null = null;
+  private selectionDragGuardDispose: (() => void) | null = null;
 
   getRenderSurface() {
     return this.map;
@@ -2874,19 +2924,8 @@ function effectiveMinZoomForPreferences(
   map: maplibregl.Map,
   requestedMinZoom: number,
 ): number {
-  const bounds = preferences.restrictBounds && normalizeMapBounds(preferences.bounds);
-  if (!bounds) return requestedMinZoom;
-
-  const mercatorBounds = mercatorBoundsForLngLatBounds(bounds);
-  const widthRatio = Math.abs(mercatorBounds.east - mercatorBounds.west);
-  const heightRatio = Math.abs(mercatorBounds.south - mercatorBounds.north);
-  if (widthRatio <= 0 || heightRatio <= 0) return requestedMinZoom;
-
   const canvas = map.getCanvas();
-  const minZoomForWidth = Math.log2(canvas.clientWidth / (512 * widthRatio));
-  const minZoomForHeight = Math.log2(canvas.clientHeight / (512 * heightRatio));
-
-  return clampNumber(Math.max(requestedMinZoom, minZoomForWidth, minZoomForHeight), 0, 24);
+  return boundsFillMinZoom(preferences, canvas.clientWidth, canvas.clientHeight, requestedMinZoom);
 }
 
 function constrainCenterToVisibleBounds(
@@ -2920,53 +2959,6 @@ function constrainCenterToVisibleBounds(
         : (mercatorBounds.north + mercatorBounds.south) / 2,
     ),
   );
-}
-
-function mercatorBoundsForLngLatBounds(bounds: MapPreferences["bounds"]): {
-  west: number;
-  south: number;
-  east: number;
-  north: number;
-} {
-  return {
-    west: mercatorXFromLng(bounds[0]),
-    south: mercatorYFromLat(bounds[1]),
-    east: mercatorXFromLng(bounds[2]),
-    north: mercatorYFromLat(bounds[3]),
-  };
-}
-
-function mercatorXFromLng(lng: number): number {
-  return (lng + 180) / 360;
-}
-
-function lngFromMercatorX(x: number): number {
-  return x * 360 - 180;
-}
-
-function mercatorYFromLat(lat: number): number {
-  const radians = (clampNumber(lat, -85, 85) * Math.PI) / 180;
-  return (1 - Math.log(Math.tan(radians) + 1 / Math.cos(radians)) / Math.PI) / 2;
-}
-
-function latFromMercatorY(y: number): number {
-  return (Math.atan(Math.sinh(Math.PI * (1 - 2 * y))) * 180) / Math.PI;
-}
-
-function normalizeMapBounds(bounds: MapPreferences["bounds"]): MapPreferences["bounds"] | null {
-  const [west, south, east, north] = bounds;
-  if (![west, south, east, north].every(Number.isFinite)) return null;
-  const normalized: MapPreferences["bounds"] = [
-    clampNumber(west, -180, 180),
-    clampNumber(south, -85, 85),
-    clampNumber(east, -180, 180),
-    clampNumber(north, -85, 85),
-  ];
-  if (normalized[0] >= normalized[2] || normalized[1] >= normalized[3]) {
-    return null;
-  }
-
-  return normalized;
 }
 
 function mapBoundsForPreferences(preferences: MapPreferences): maplibregl.LngLatBoundsLike | null {

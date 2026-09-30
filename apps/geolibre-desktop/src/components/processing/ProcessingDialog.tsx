@@ -1,4 +1,4 @@
-import { useAppStore, type GeoLibreLayer } from "@geolibre/core";
+import { useAppStore, useLayersWhen, type GeoLibreLayer } from "@geolibre/core";
 import { getLayerBounds, type MapEngine } from "@geolibre/map";
 import {
   clearRemoteWhiteboxCatalogSnapshotCache,
@@ -62,6 +62,8 @@ import {
   subsetUrlToolKind,
 } from "../../lib/subset-tool-url";
 import { buildWhiteboxToolShareUrl, whiteboxToolShareBase } from "../../lib/whitebox-tool-url";
+import { searchWhiteboxTools } from "../../lib/whitebox-tool-search";
+import { useWhiteboxSemanticSearch } from "../../hooks/useWhiteboxSemanticSearch";
 import { fieldSourceInputName, isFieldParameterName } from "../../lib/whitebox-field-params";
 import {
   DISTANCE_UNITS,
@@ -164,6 +166,7 @@ function fileOutputExtension(bytes: Uint8Array): string {
   if (matches([0x66, 0x67, 0x62, 0x03])) return "fgb"; // FlatGeobuf "fgb\x03"
   if (matches([0x50, 0x4b, 0x03, 0x04])) return "zip"; // Shapefile bundle "PK\x03\x04"
   if (matches([0x89, 0x50, 0x4e, 0x47])) return "png";
+  if (matches([0x4c, 0x41, 0x53, 0x46])) return "las"; // "LASF" (LAS/LAZ)
   // "PMTiles"
   if (matches([0x50, 0x4d, 0x54, 0x69, 0x6c, 0x65, 0x73])) return "pmtiles";
   return "bin";
@@ -420,7 +423,10 @@ export function ProcessingDialog({ mapControllerRef, onAddRaster }: ProcessingDi
   const setProcessingOpen = useAppStore((s) => s.setProcessingOpen);
   const processingInitialTool = useAppStore((s) => s.ui.processingInitialTool);
   const setProcessingInitialTool = useAppStore((s) => s.setProcessingInitialTool);
-  const layers = useAppStore((s) => s.layers);
+  // Layers are only read while the dialog is open; closed, it stays mounted (to
+  // keep its form, window position and job polling) without re-rendering on
+  // layer edits.
+  const layers = useLayersWhen(open);
   const addGeoJsonLayer = useAppStore((s) => s.addGeoJsonLayer);
   const rerun = useAppStore((s) => s.ui.processingRerun);
   const setProcessingRerun = useAppStore((s) => s.setProcessingRerun);
@@ -915,26 +921,83 @@ export function ProcessingDialog({ mapControllerRef, onAddRaster }: ProcessingDi
     ];
   }, [tools, matchesSource, t, i18n.language]);
 
+  // Everything the category and source filters allow, before the search text.
+  // Memoized apart from the search so the semantic lookup below sees a stable
+  // list across keystrokes, and so it searches the same scope the list shows.
+  const scopedTools = useMemo(
+    () =>
+      tools.filter(
+        (tool) => (category === "All" || (tool.category ?? "") === category) && matchesSource(tool),
+      ),
+    [category, matchesSource, tools],
+  );
+
   const filteredTools = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
-    return tools.filter((tool) => {
-      if (category !== "All" && (tool.category ?? "") !== category) {
-        return false;
-      }
-      if (!matchesSource(tool)) return false;
-      if (!normalizedQuery) return true;
-      return [
+    return searchWhiteboxTools(scopedTools, normalizedQuery, (tool) => ({
+      name: [
         tool.id,
         toolLabel(t, tool),
         tool.category ?? "",
         translateWhiteboxCategory(t, tool.category),
-        tool.summary || "",
-      ]
-        .join(" ")
-        .toLowerCase()
-        .includes(normalizedQuery);
-    });
-  }, [category, matchesSource, query, t, tools]);
+      ].join(" "),
+      // The tool's own names, which is what exact/prefix ranking measures. The
+      // categories stay out: they are shared by dozens of tools, so ranking
+      // them would let "terrain" promote everything filed under Terrain ahead
+      // of the tools actually named after it.
+      identifiers: [tool.id, toolLabel(t, tool)],
+      summary: tool.summary || "",
+    }));
+  }, [query, scopedTools, t]);
+
+  // A second, optional search that understands a description of an operation
+  // rather than a word from the catalog ("remove sinks so water drains off the
+  // edge" -> fill_depressions). Off entirely unless the deployment configured a
+  // System One endpoint, and never a substitute for the filter above: its hits
+  // are shown as their own group in front of it, so the substring list someone
+  // is already reading keeps its order. #2566
+  const semantic = useWhiteboxSemanticSearch(query, scopedTools, filteredTools, !loadingTools);
+
+  const semanticTools = useMemo(() => {
+    if (!semantic.matches?.length) return [];
+    const byId = new Map(scopedTools.map((tool) => [tool.id, tool]));
+    return semantic.matches
+      .map((match) => byId.get(match.id))
+      .filter((tool): tool is WhiteboxTool => tool !== undefined);
+  }, [semantic.matches, scopedTools]);
+
+  // The substring hits the ranked group does not already show. Listing a tool
+  // twice under two headings reads as two different tools.
+  const keywordTools = useMemo(() => {
+    if (semanticTools.length === 0) return filteredTools;
+    const ranked = new Set(semanticTools.map((tool) => tool.id));
+    return filteredTools.filter((tool) => !ranked.has(tool.id));
+  }, [filteredTools, semanticTools]);
+
+  const renderToolRow = useCallback(
+    (tool: WhiteboxTool) => (
+      <button
+        key={tool.id}
+        type="button"
+        ref={selectedTool?.id === tool.id ? selectedButtonRef : undefined}
+        className={cn(
+          "block w-full px-3 py-2 text-start text-sm transition-colors hover:bg-accent",
+          selectedTool?.id === tool.id && "bg-accent",
+          tool.locked && "opacity-60",
+        )}
+        onClick={() => setSelectedToolId(tool.id)}
+      >
+        <span className="block truncate font-medium">
+          {tool.locked ? t("processing.whitebox.lockedPrefix") : ""}
+          {toolLabel(t, tool)}
+        </span>
+        <span className="block truncate text-xs text-muted-foreground">
+          {translateWhiteboxCategory(t, tool.category)}
+        </span>
+      </button>
+    ),
+    [selectedTool?.id, t],
+  );
 
   const loadWhitebox = useCallback(async () => {
     setLoadingTools(true);
@@ -1525,7 +1588,10 @@ export function ProcessingDialog({ mapControllerRef, onAddRaster }: ProcessingDi
         // output only as "Optional output path" — so sniff the bytes rather
         // than trust the declared kind, the way the scripting/assistant path
         // does, and put a raster on the map instead of downloading it.
-        const declaredFile = outKind === "file_out" || outKind === "vector_out";
+        // A `lidar_out` (a classified/filtered LAS from the WASM runner) is
+        // downloaded too; it never belongs on the raster path.
+        const declaredFile =
+          outKind === "file_out" || outKind === "vector_out" || outKind === "lidar_out";
         if (declaredFile && (!isTiff(value) || !onAddRaster)) {
           const label = `${jobToolLabel} ${humanize(name)}`.replace(/\s+/g, "_");
           // Prefer the content signature: a `vector_out` and most binary
@@ -1999,9 +2065,23 @@ export function ProcessingDialog({ mapControllerRef, onAddRaster }: ProcessingDi
               <Input
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
-                className="ps-9"
-                placeholder={t("processing.searchTools")}
+                // The end padding is reserved whenever the lookup could run, not
+                // only while it is running: letting it appear with the spinner
+                // would reflow the text under the cursor mid-typing.
+                className={cn("ps-9", semantic.available && "pe-9")}
+                placeholder={
+                  semantic.available
+                    ? t("processing.whitebox.searchToolsByMeaning")
+                    : t("processing.searchTools")
+                }
               />
+              {semantic.pending && (
+                <Loader2
+                  role="status"
+                  aria-label={t("processing.whitebox.searchingByMeaning")}
+                  className="absolute end-3 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-muted-foreground"
+                />
+              )}
             </div>
             <Button
               type="button"
@@ -2110,32 +2190,37 @@ export function ProcessingDialog({ mapControllerRef, onAddRaster }: ProcessingDi
                   <Loader2 className="h-4 w-4 animate-spin" />
                   {t("processing.whitebox.loadingTools")}
                 </div>
-              ) : filteredTools.length === 0 ? (
-                <div className="p-3 text-sm text-muted-foreground">
-                  {t("processing.whitebox.noToolsFound")}
-                </div>
+              ) : filteredTools.length === 0 && semanticTools.length === 0 ? (
+                // A phrase with no substring hits is exactly the case the
+                // lookup exists for, so saying "no tools found" while still
+                // asking would have the dialog contradict itself for ~900ms.
+                semantic.pending ? (
+                  <div className="flex items-center gap-2 p-3 text-sm text-muted-foreground">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    {t("processing.whitebox.searchingByMeaning")}
+                  </div>
+                ) : (
+                  <div className="p-3 text-sm text-muted-foreground">
+                    {t("processing.whitebox.noToolsFound")}
+                  </div>
+                )
               ) : (
-                filteredTools.map((tool) => (
-                  <button
-                    key={tool.id}
-                    type="button"
-                    ref={selectedTool?.id === tool.id ? selectedButtonRef : undefined}
-                    className={cn(
-                      "block w-full px-3 py-2 text-start text-sm transition-colors hover:bg-accent",
-                      selectedTool?.id === tool.id && "bg-accent",
-                      tool.locked && "opacity-60",
-                    )}
-                    onClick={() => setSelectedToolId(tool.id)}
-                  >
-                    <span className="block truncate font-medium">
-                      {tool.locked ? t("processing.whitebox.lockedPrefix") : ""}
-                      {toolLabel(t, tool)}
-                    </span>
-                    <span className="block truncate text-xs text-muted-foreground">
-                      {translateWhiteboxCategory(t, tool.category)}
-                    </span>
-                  </button>
-                ))
+                <>
+                  {/* Headings appear only once the lookup has answered, so with
+                      it off or unanswered this is the flat list it always was. */}
+                  {semanticTools.length > 0 && (
+                    <div className="bg-muted/50 px-3 py-1.5 text-xs font-medium text-muted-foreground">
+                      {t("processing.whitebox.bestMatches")}
+                    </div>
+                  )}
+                  {semanticTools.map(renderToolRow)}
+                  {semanticTools.length > 0 && keywordTools.length > 0 && (
+                    <div className="bg-muted/50 px-3 py-1.5 text-xs font-medium text-muted-foreground">
+                      {t("processing.whitebox.otherMatches")}
+                    </div>
+                  )}
+                  {keywordTools.map(renderToolRow)}
+                </>
               )}
             </div>
           </ScrollArea>
@@ -2216,7 +2301,14 @@ export function ProcessingDialog({ mapControllerRef, onAddRaster }: ProcessingDi
               </Button>
             </div>
             {selectedTool?.summary && (
-              <p className="mt-2 max-w-3xl text-sm text-muted-foreground">
+              // Height-bounded and scrollable, not clamped. Catalog summaries
+              // run from one line to ~2,400 characters (`lee_filter`), and the
+              // long ones rendered 340px tall in a 624px dialog — pushing the
+              // parameter form and the Run button below the fold on the tools
+              // whose parameters most need explaining. Scrolling keeps the full
+              // text, which is the useful half of it, without letting it take
+              // the dialog over.
+              <p className="mt-2 max-h-24 max-w-3xl overflow-y-auto text-sm text-muted-foreground">
                 {translateToolDescription(t, "whitebox", {
                   id: selectedTool.id,
                   name: toolLabel(t, selectedTool),

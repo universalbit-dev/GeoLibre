@@ -1,4 +1,10 @@
 import { readControlPreference, writeControlPreference } from "../../lib/control-preferences";
+import {
+  SCRIPT_MAP_CONTROL_EVENT,
+  clearScriptMapControls,
+  forgetScriptMapControl,
+  type ScriptMapControlDetail,
+} from "../../lib/scripting/ui-controls";
 import { supportsAddDataRenderer } from "../../lib/add-data-renderer";
 import {
   DEFAULT_PROJECT_NAME,
@@ -50,6 +56,11 @@ import {
   setEarthdataGisLabels,
   setOpenAerialMapLabels,
   setArcGisHubLabels,
+  setTennesseeGisLabels,
+  setUsStateGisLabels,
+  setUsLocalGisLabels,
+  setUsFederalGisLabels,
+  type ArcGisHubLabels,
   setOpenDataCatalogLabels,
   setHuggingFaceLabels,
   setSourceCoopLabels,
@@ -113,6 +124,7 @@ import type { ProjectFileActions } from "../../hooks/useProjectFileActions";
 import { useToolbarPanels } from "../../hooks/useToolbarPanels";
 import { useVectorTileGeometryBackfill } from "../../hooks/useVectorTileGeometryBackfill";
 import type { ThemeMode } from "../../hooks/useThemeMode";
+import { resolveAppName } from "../../lib/app-name";
 import { isMobile } from "../../lib/is-mobile";
 import { isTauri } from "../../lib/tauri-io";
 import { isMaptoolkitBasemapActive } from "../../lib/maptoolkit-basemap";
@@ -375,7 +387,7 @@ export function TopToolbar({
       metaSource: t("openAerialMap.metaSource"),
       metaRaw: t("openAerialMap.metaRaw"),
     });
-    setArcGisHubLabels({
+    const arcGisHubLabels: ArcGisHubLabels = {
       hint: t("arcgisHub.hint"),
       searchPlaceholder: t("arcgisHub.searchPlaceholder"),
       search: t("arcgisHub.search"),
@@ -388,10 +400,13 @@ export function TopToolbar({
       noResults: t("arcgisHub.noResults"),
       searchError: t("arcgisHub.searchError"),
       showing: (shown, total) => t("arcgisHub.showing", { shown, total }),
+      showingSome: (shown) => t("arcgisHub.showingSome", { shown }),
       noDescription: t("arcgisHub.noDescription"),
       add: t("arcgisHub.add"),
       adding: (title) => t("arcgisHub.adding", { title }),
       added: (title) => t("arcgisHub.added", { title }),
+      addedCapped: (title, limit) =>
+        t("arcgisHub.addedCapped", { title, limit: limit.toLocaleString(i18n.language) }),
       addError: t("arcgisHub.addError"),
       zoom: t("arcgisHub.zoom"),
       download: t("arcgisHub.download"),
@@ -399,10 +414,55 @@ export function TopToolbar({
       downloading: (completed, total, title) =>
         t("arcgisHub.downloading", { completed, total, title }),
       downloadStarted: (title) => t("arcgisHub.downloadStarted", { title }),
+      downloadCapped: (title, limit) =>
+        t("arcgisHub.downloadCapped", { title, limit: limit.toLocaleString(i18n.language) }),
       downloadFirstLayer: (title, layerCount) =>
         t("arcgisHub.downloadFirstLayer", { title, layerCount }),
       downloadError: t("arcgisHub.downloadError"),
       details: t("arcgisHub.details"),
+    };
+    setArcGisHubLabels(arcGisHubLabels);
+    // The Tennessee portal is an ArcGIS Hub site, so it shares the panel's
+    // strings and overrides only the ones that name the catalog.
+    setTennesseeGisLabels({
+      ...arcGisHubLabels,
+      hint: t("tennesseeGis.hint"),
+      searchPlaceholder: t("tennesseeGis.searchPlaceholder"),
+      noResults: t("tennesseeGis.noResults"),
+      searchError: t("tennesseeGis.searchError"),
+    });
+    setUsStateGisLabels({
+      ...arcGisHubLabels,
+      hint: t("usStateGis.hint"),
+      searchPlaceholder: t("usStateGis.searchPlaceholder"),
+      noResults: t("usStateGis.noResults"),
+      searchError: t("usStateGis.searchError"),
+      catalogSet: t("usStateGis.chooseState"),
+      catalog: t("usStateGis.portal"),
+      chooseCatalogSet: t("usStateGis.chooseStateHint"),
+      openPortal: t("usStateGis.openPortal"),
+    });
+    setUsLocalGisLabels({
+      ...arcGisHubLabels,
+      hint: t("usLocalGis.hint"),
+      searchPlaceholder: t("usLocalGis.searchPlaceholder"),
+      noResults: t("usLocalGis.noResults"),
+      searchError: t("usLocalGis.searchError"),
+      catalogSet: t("usLocalGis.chooseState"),
+      catalog: t("usLocalGis.portal"),
+      chooseCatalogSet: t("usLocalGis.chooseStateHint"),
+      openPortal: t("usLocalGis.openPortal"),
+    });
+    setUsFederalGisLabels({
+      ...arcGisHubLabels,
+      hint: t("usFederalGis.hint"),
+      searchPlaceholder: t("usFederalGis.searchPlaceholder"),
+      noResults: t("usFederalGis.noResults"),
+      searchError: t("usFederalGis.searchError"),
+      catalogSet: t("usFederalGis.chooseDepartment"),
+      catalog: t("usFederalGis.agency"),
+      chooseCatalogSet: t("usFederalGis.chooseDepartmentHint"),
+      openPortal: t("usFederalGis.openPortal"),
     });
     setOpenDataCatalogLabels({
       socrataHint: t("openDataCatalogs.socrataHint"),
@@ -1260,6 +1320,24 @@ export function TopToolbar({
     }
   }, [mapControllerRef, mapReadyGeneration, controlsVisible]);
 
+  // A script (the Jupyter widget's show_control/hide_control) toggles a control
+  // on the map directly; mirror it here so the Controls menu checkmark agrees
+  // and the effect above does not revert it on the next renderer swap. The
+  // choice is per session, so unlike a menu toggle it is not written to the
+  // device preference. Only the checkmark is mirrored here: re-applying the
+  // control to a new map belongs to `useScriptControlRestore`, since this
+  // toolbar is unmounted in `?maponly` embeds.
+  useEffect(() => {
+    const onScriptControl = (event: Event) => {
+      const { control, visible } = (event as CustomEvent<ScriptMapControlDetail>).detail;
+      setControlsVisible((current) =>
+        current[control] === visible ? current : { ...current, [control]: visible },
+      );
+    };
+    window.addEventListener(SCRIPT_MAP_CONTROL_EVENT, onScriptControl);
+    return () => window.removeEventListener(SCRIPT_MAP_CONTROL_EVENT, onScriptControl);
+  }, []);
+
   const terrainEnabled = useAppStore((state) => state.preferences.map.terrainEnabled);
 
   // Terrain is project state, unlike the other optional map chrome, so applying
@@ -1394,6 +1472,13 @@ export function TopToolbar({
         NEW_PROJECT_VISIBLE_BUILT_IN_CONTROLS.has(control),
       );
     }
+    // New Project resets every control to its default, so an earlier scripted
+    // override is spent: without this `useScriptControlRestore` would re-apply
+    // it to the live map on this same project-generation bump (parent effects
+    // run after this child's) and desync the map from the checkmarks reset
+    // just above. A widget project push does not come through here, so it
+    // still keeps the controls a script set.
+    clearScriptMapControls();
     setControlsVisible(newProjectToolbarControlVisibility());
   };
 
@@ -1414,8 +1499,12 @@ export function TopToolbar({
       appApi.getMapRenderer?.() === "arcgis"
         ? openAddDataKind("pmtiles")
         : openPMTilesLayerPanel(appApi),
+    // The ArcGIS view and the globe draw Zarr natively and have no Zarr control
+    // to open, so they take the Add Data form instead.
     zarr: () =>
-      appApi.getMapRenderer?.() === "arcgis" ? openAddDataKind("zarr") : openZarrLayerPanel(appApi),
+      appApi.getMapRenderer?.() === "arcgis" || appApi.getMapRenderer?.() === "cesium"
+        ? openAddDataKind("zarr")
+        : openZarrLayerPanel(appApi),
     netcdf: () => setNetcdfDialogOpen(true),
     lidar: () => openLidarLayerPanel(appApi),
     splatting: () => openSplattingLayerPanel(appApi),
@@ -1428,6 +1517,10 @@ export function TopToolbar({
     const visible = !controlsVisible[control];
     const updated = mapControllerRef.current?.setBuiltInControlVisible(control, visible) ?? false;
     if (!updated) return;
+    // An explicit user choice revokes an earlier scripted one, so
+    // `useScriptControlRestore` stops forcing the scripted value back on the
+    // next renderer swap or project load.
+    forgetScriptMapControl(control);
     setControlsVisible((current) => ({ ...current, [control]: visible }));
     if (control !== "terrain" && control !== "maptoolkit-logo")
       writeControlPreference(control, visible);
@@ -1550,20 +1643,17 @@ export function TopToolbar({
           },
         ]
       : []),
-    // Print layout renders from the MapLibre canvas; the palette has no disabled
-    // state, so drop the command rather than offer one that opens a dialog which
-    // cannot produce a preview (#2268 review).
-    ...(capabilities.nativeMapInstance
-      ? [
-          {
-            id: "project.print-layout",
-            title: t("toolbar.item.printLayoutEllipsis"),
-            group: t("toolbar.commandGroup.project"),
-            icon: Printer,
-            run: () => setPrintLayoutOpen(true),
-          },
-        ]
-      : []),
+    // The composer captures through the engine's render surface, so it produces
+    // a preview on every renderer (#2475); it was gated on a MapLibre map back
+    // when it read that canvas directly (#2268 review), which left the menu item
+    // working while the palette had no entry at all.
+    {
+      id: "project.print-layout",
+      title: t("toolbar.item.printLayoutEllipsis"),
+      group: t("toolbar.commandGroup.project"),
+      icon: Printer,
+      run: () => setPrintLayoutOpen(true),
+    },
     // Add Data
     {
       id: "add.vector",
@@ -2154,7 +2244,8 @@ export function TopToolbar({
   // on iOS and Android too — where the app is named plain "GeoLibre" (the bundle
   // name from tauri.ios.conf.json, the home-screen icon, and the store listing),
   // so titling it "GeoLibre Desktop" there contradicts every other surface.
-  const appTitle = isTauri() && !isMobile() ? "GeoLibre Desktop" : "GeoLibre";
+  // A deployment can replace either with its own name (GEOLIBRE_APP_NAME).
+  const appTitle = resolveAppName(isTauri() && !isMobile() ? "GeoLibre Desktop" : "GeoLibre");
   const renderToolbarLabel = (label: string) =>
     showLabels ? <span className="hidden sm:inline">{label}</span> : null;
   const chrome: ToolbarChrome = {
@@ -2395,6 +2486,7 @@ export function TopToolbar({
           open={gpsTrackingOpen}
           onOpenChange={setGpsTrackingOpen}
           mapControllerRef={mapControllerRef}
+          mapReadyGeneration={mapReadyGeneration}
         />
       )}
       <RecordTourDialog
@@ -2411,6 +2503,7 @@ export function TopToolbar({
         open={georeferencerOpen}
         onOpenChange={setGeoreferencerOpen}
         mapControllerRef={mapControllerRef}
+        mapReadyGeneration={mapReadyGeneration}
       />
       <SetViewDialog
         open={setViewOpen}
@@ -2451,7 +2544,9 @@ export function TopToolbar({
       <ProjectGalleryDialog
         open={galleryDialogOpen}
         onOpenChange={setGalleryDialogOpen}
-        onOpenProject={(url, authToken) => projectFiles.openProjectFromShareUrl(url, { authToken })}
+        onOpenProject={(url, authToken, options) =>
+          projectFiles.openProjectFromShareUrl(url, { authToken, ...options })
+        }
       />
       {isMenuVisible(uiProfile, "help") && (
         <HelpMenu

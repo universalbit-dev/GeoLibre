@@ -83,6 +83,8 @@ describe("Tier 1 built-in plugin engine support audit", () => {
   // what they add as well; the basemap presets are style swaps the Mapbox
   // engine does not host.
   it("declares Mapbox support on the store-only catalog browsers", () => {
+    // These read the view only through `getViewBounds`, which every engine
+    // answers, so the ArcGIS renderer draws what they add too (#2477).
     for (const plugin of [
       maplibreSourceCoopPlugin,
       maplibreNaturalEarthPlugin,
@@ -90,7 +92,7 @@ describe("Tier 1 built-in plugin engine support audit", () => {
       maplibreSocrataPlugin,
       maplibreCkanPlugin,
     ]) {
-      assert.deepEqual(plugin.engines, ["maplibre", "cesium", "mapbox"], plugin.id);
+      assert.deepEqual(plugin.engines, ["maplibre", "cesium", "mapbox", "arcgis"], plugin.id);
     }
     for (const plugin of [osmBasemapPlugin, cartoLightPlugin]) {
       assert.equal(isPluginEngineSupported(plugin, "mapbox"), false, plugin.id);
@@ -109,14 +111,15 @@ describe("Tier 1 built-in plugin engine support audit", () => {
   // The STAC plugins come out of the same createStacPlugin factory, so they
   // are audited together: footprints, bbox drawing and picking use the
   // native GeoJSON APIs shared by MapLibre and Mapbox.
-  it("declares MapLibre and Mapbox support on the STAC catalog plugins", () => {
+  it("declares MapLibre, Mapbox and ArcGIS support on the STAC catalog plugins", () => {
     for (const plugin of [
       maplibreStacCatalogsPlugin,
       maplibrePlanetOpenDataPlugin,
       maplibrePortolanPlugin,
     ]) {
-      assert.deepEqual(plugin.engines, ["maplibre", "mapbox"]);
+      assert.deepEqual(plugin.engines, ["maplibre", "mapbox", "arcgis"]);
       assert.equal(isPluginEngineSupported(plugin, "mapbox"), true);
+      assert.equal(isPluginEngineSupported(plugin, "arcgis"), true);
       assert.equal(isPluginEngineSupported(plugin, "maplibre"), true);
       assert.equal(isPluginEngineSupported(plugin, "cesium"), false);
     }

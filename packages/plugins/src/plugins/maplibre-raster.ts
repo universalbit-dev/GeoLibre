@@ -441,6 +441,22 @@ export async function setRasterRenderEngine(
 }
 
 /**
+ * The engine the shared raster control renders COGs with, mounting the control
+ * first when needed (a fresh one starts on `cog-tiler-wasm`). Lets a built-in
+ * plugin choose a path that suits the active engine instead of switching it,
+ * since the engine is control-wide and a switch re-renders every raster.
+ *
+ * @param app - The GeoLibre app API for the current map.
+ * @returns The active engine, or null when the control cannot be initialized.
+ */
+export async function getRasterRenderEngine(
+  app: GeoLibreAppAPI,
+): Promise<RasterRenderEngine | null> {
+  const control = await ensureRasterControl(app);
+  return control ? control.getEngine() : null;
+}
+
+/**
  * Mount and warm the raster control without opening its panel.
  *
  * Desktop calls this as soon as a native file drag enters the window, so the
@@ -865,6 +881,8 @@ async function readLocalRasterFiles(control: RasterControl): Promise<Map<string,
 async function ensureRasterControl(app: GeoLibreAppAPI): Promise<RasterControl | null> {
   const RasterControlClass = await getRasterControlClass();
 
+  // A Mapbox check: null on the other engines, ArcGIS included (whose COGs
+  // take addArcgisRaster and never mount this control). engine-audit-allow: arcgis-null-map
   rasterControl ??= createRasterControl(RasterControlClass, !!app.getMapboxMap?.());
 
   if (!rasterControlMounted) {
@@ -895,6 +913,7 @@ async function ensureRasterControl(app: GeoLibreAppAPI): Promise<RasterControl |
     wireRasterCloseButton(rasterControl);
     wireRasterBrowseButton(rasterControl);
     applyRasterPanelClass(rasterControl);
+    // engine-audit-allow: arcgis-null-map (a Mapbox check, as above)
     if (app.getMapboxMap?.()) {
       const panel = (rasterControl as unknown as RasterControlInternals)._panel;
       panel?.querySelector('option[value="cog-tiler-wasm"]')?.remove();

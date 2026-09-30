@@ -14,14 +14,13 @@ import {
 } from "@geolibre/core";
 import type { Layer } from "@deck.gl/core";
 import type { Map as MapLibreMap } from "maplibre-gl";
-import {
-  DEFAULT_TILESET_URL,
+import type {
+  LoadedTilesetMetadata,
   ThreeDTilesControl,
+  ThreeDTilesControlEventHandler,
+  ThreeDTilesControlOptions,
+  ThreeDTilesItemState,
   ThreeDTilesLayer,
-  type LoadedTilesetMetadata,
-  type ThreeDTilesControlEventHandler,
-  type ThreeDTilesControlOptions,
-  type ThreeDTilesItemState,
 } from "maplibre-gl-3d-tiles";
 import type { GeoLibreAppAPI, GeoLibreDeckGL, GeoLibreMapControlPosition } from "../types";
 import {
@@ -31,6 +30,7 @@ import {
 import { ensureSharedDeckOverlay, setSharedDeckLayers } from "./shared-deck-overlay";
 import {
   addArcgisI3sTilesLayer,
+  applyThreeDTilesTilesetMemoryLimit,
   arcgisI3sSceneLayerName,
   createArcgisI3sStoreLayer,
   isArcgisI3sSceneLayerUrl,
@@ -74,6 +74,12 @@ const GOOGLE_PHOTOREALISTIC_TILES_LABEL = "Google Photorealistic 3D Tiles";
 const ARCGIS_I3S_SAMPLE_TILES_URL =
   "https://tiles.arcgis.com/tiles/z2tnIkrLQ2BRzr6P/arcgis/rest/services/SanFrancisco_Bldgs/SceneServer/layers/0";
 const ARCGIS_I3S_SAMPLE_TILES_LABEL = "San Francisco Buildings (ArcGIS I3S)";
+const THREE_D_BAG_SAMPLE_TILES_URL =
+  "https://data.3dbag.nl/v20250903/cesium3dtiles/lod22/tileset.json";
+const THREE_D_BAG_SAMPLE_TILES_LABEL = "3D BAG Netherlands (LoD 2.2)";
+// 3D BAG stores ellipsoidal heights; the geoid sits ~43 m above the ellipsoid
+// across the Netherlands, so this puts NAP ground level on the map.
+const THREE_D_BAG_SAMPLE_ALTITUDE_OFFSET = -43;
 const GOOGLE_MAPS_API_KEY_MASK = "********";
 const GOOGLE_PHOTOREALISTIC_SOURCE_KIND = "google-photorealistic-3d-tiles";
 const GOOGLE_PHOTOREALISTIC_LAYER_ID_PREFIX = "geolibre-google-photorealistic-3d-tiles";
@@ -84,27 +90,51 @@ const GOOGLE_PHOTOREALISTIC_INITIAL_VIEW = {
   pitch: 60,
 };
 
-const THREE_D_TILES_OPTIONS = {
-  className: "geolibre-3d-tiles-control",
-  collapsed: true,
-  collapseOnClickOutside: false,
-  layerId: THREE_D_TILES_LAYER_ID,
-  panelWidth: 365,
-  title: "Add 3D Tiles Layer",
-  // Empty input; the sample tileset is the explicit, opt-in way to load one.
-  tilesetUrl: "",
-  sampleData: [
-    { label: "AGI HQ", url: DEFAULT_TILESET_URL },
-    {
-      label: GOOGLE_PHOTOREALISTIC_TILES_LABEL,
-      url: GOOGLE_PHOTOREALISTIC_TILES_URL,
-    },
-    {
-      label: ARCGIS_I3S_SAMPLE_TILES_LABEL,
-      url: ARCGIS_I3S_SAMPLE_TILES_URL,
-    },
-  ],
-} satisfies ThreeDTilesControlOptions;
+/**
+ * Builds the options for a new ThreeDTilesControl.
+ *
+ * @param defaultTilesetUrl - The package's sample tileset URL, read from the
+ *   lazily imported module.
+ * @returns The control options.
+ */
+const threeDTilesOptions = (defaultTilesetUrl: string) =>
+  ({
+    className: "geolibre-3d-tiles-control",
+    collapsed: true,
+    collapseOnClickOutside: false,
+    layerId: THREE_D_TILES_LAYER_ID,
+    panelWidth: 365,
+    title: "Add 3D Tiles Layer",
+    // Empty input; the sample tileset is the explicit, opt-in way to load one.
+    tilesetUrl: "",
+    sampleData: [
+      { label: "AGI HQ", url: defaultTilesetUrl },
+      {
+        label: GOOGLE_PHOTOREALISTIC_TILES_LABEL,
+        url: GOOGLE_PHOTOREALISTIC_TILES_URL,
+      },
+      {
+        label: ARCGIS_I3S_SAMPLE_TILES_LABEL,
+        url: ARCGIS_I3S_SAMPLE_TILES_URL,
+      },
+      {
+        label: THREE_D_BAG_SAMPLE_TILES_LABEL,
+        url: THREE_D_BAG_SAMPLE_TILES_URL,
+        altitudeOffset: THREE_D_BAG_SAMPLE_ALTITUDE_OFFSET,
+      },
+    ],
+  }) satisfies ThreeDTilesControlOptions;
+
+type ThreeDTilesModule = typeof import("maplibre-gl-3d-tiles");
+
+// maplibre-gl-3d-tiles (~0.8 MB) is imported on first use, not at startup.
+// The resolved module is kept so code that runs once a control exists can use
+// it synchronously.
+let threeDTilesModule: ThreeDTilesModule | null = null;
+let threeDTilesModulePromise: Promise<ThreeDTilesModule> | null = null;
+// Bumped by closeThreeDTilesLayerPanel so an open or restore still awaiting the
+// package import does not mount the control after the panel was closed.
+let threeDTilesLoadGeneration = 0;
 
 let threeDTilesControl: ThreeDTilesControl | null = null;
 let threeDTilesControlMounted = false;
@@ -159,11 +189,61 @@ interface ThreeDTilesControlInternals {
   };
 }
 
+/**
+ * Loads maplibre-gl-3d-tiles on first use.
+ *
+ * A failed load (e.g. offline) is dropped so the next call retries the import.
+ *
+ * @returns The package module.
+ */
+function loadThreeDTilesModule(): Promise<ThreeDTilesModule> {
+  if (threeDTilesModulePromise) return threeDTilesModulePromise;
+  const promise = import("maplibre-gl-3d-tiles").then((module) => {
+    // When the stale-chunk handler cancels Vite's preload error, the import
+    // resolves to undefined instead of rejecting; treat that as a failure.
+    if (!module) throw new Error("maplibre-gl-3d-tiles failed to load");
+    threeDTilesModule = module;
+    return module;
+  });
+  threeDTilesModulePromise = promise;
+  promise.catch(() => {
+    if (threeDTilesModulePromise === promise) threeDTilesModulePromise = null;
+  });
+  return promise;
+}
+
+/**
+ * Runs `callback` once maplibre-gl-3d-tiles is loaded: synchronously when it
+ * already is, otherwise after the import resolves. The callback is skipped when
+ * the panel was closed (or a new project reset it) while the package loaded.
+ *
+ * @param action - What is being loaded for, used in the failure log.
+ * @param callback - The work that needs the package.
+ */
+function withThreeDTilesModule(action: string, callback: () => void): void {
+  if (threeDTilesModule) {
+    callback();
+    return;
+  }
+  const generation = threeDTilesLoadGeneration;
+  loadThreeDTilesModule().then(
+    () => {
+      if (generation === threeDTilesLoadGeneration) callback();
+    },
+    (error: unknown) => {
+      console.error(`[GeoLibre] Failed to load the 3D Tiles control to ${action}`, error);
+    },
+  );
+}
+
 export function openThreeDTilesLayerPanel(app: GeoLibreAppAPI): void {
-  openStandaloneThreeDTilesControl(app);
+  withThreeDTilesModule("open the panel", () => {
+    openStandaloneThreeDTilesControl(app);
+  });
 }
 
 export function closeThreeDTilesLayerPanel(app: GeoLibreAppAPI): void {
+  threeDTilesLoadGeneration += 1;
   if (threeDTilesControl && threeDTilesControlMounted) {
     app.removeMapControl(threeDTilesControl);
     return;
@@ -191,6 +271,18 @@ export function restoreThreeDTilesLayers(app: GeoLibreAppAPI): void {
     return;
   }
 
+  if (!useAppStore.getState().layers.some(isThreeDTilesControlLayer)) return;
+  withThreeDTilesModule("restore 3D Tiles layers", () => restoreThreeDTilesControlLayers(app));
+}
+
+/**
+ * Restores the tileset layers the MapLibre 3D Tiles control paints. Needs the
+ * maplibre-gl-3d-tiles module to be loaded.
+ *
+ * @param app - The GeoLibre app API.
+ */
+function restoreThreeDTilesControlLayers(app: GeoLibreAppAPI): void {
+  // Re-read the store: the project may have changed while the package loaded.
   const layers = useAppStore.getState().layers.filter(isThreeDTilesControlLayer);
   if (layers.length === 0) return;
 
@@ -286,7 +378,8 @@ function ensureThreeDTilesControl(app: GeoLibreAppAPI): ThreeDTilesControl | nul
 }
 
 function createThreeDTilesControl(): ThreeDTilesControl {
-  const control = new ThreeDTilesControl(THREE_D_TILES_OPTIONS);
+  const { DEFAULT_TILESET_URL, ThreeDTilesControl } = requireThreeDTilesModule();
+  const control = new ThreeDTilesControl(threeDTilesOptions(DEFAULT_TILESET_URL));
   const syncHandler: ThreeDTilesControlEventHandler = () => {
     if (!isThreeDTilesStoreSyncSuspended()) {
       syncThreeDTilesStoreFromControl(control);
@@ -459,6 +552,7 @@ function restoreThreeDTilesMapLayer(
     return;
   }
 
+  const { ThreeDTilesLayer } = requireThreeDTilesModule();
   const restoredLayer = new ThreeDTilesLayer({
     id: layerId,
     tilesetUrl: url,
@@ -599,6 +693,19 @@ function createThreeDTilesLayerUpdate(
   }
 
   return Object.keys(update).length > 0 ? update : null;
+}
+
+/**
+ * Returns the loaded maplibre-gl-3d-tiles module. Only called on paths that run
+ * after {@link withThreeDTilesModule} resolved it.
+ *
+ * @returns The package module.
+ */
+function requireThreeDTilesModule(): ThreeDTilesModule {
+  if (!threeDTilesModule) {
+    throw new Error("maplibre-gl-3d-tiles is used before it was loaded");
+  }
+  return threeDTilesModule;
 }
 
 function patchThreeDTilesControlOnRemove(control: ThreeDTilesControl): void {
@@ -1661,6 +1768,7 @@ function buildGooglePhotorealisticTilesDeckLayer(layer: GeoLibreLayer): Layer | 
       ...THREE_D_TILES_DECK_LOAD_OPTIONS,
       fetch: requestHeaders ? { headers: requestHeaders } : undefined,
     },
+    onTilesetLoad: applyThreeDTilesTilesetMemoryLimit,
     opacity: layer.opacity,
     pickable: false,
     operation: "draw",
